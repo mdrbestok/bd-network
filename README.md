@@ -22,16 +22,22 @@ This proof-of-concept application allows you to:
 ### Option A: Local Development (SQLite - Recommended)
 
 ```bash
-# Terminal 1: Start Backend
+# 1. Install dependencies (one-time)
+cd backend && pip install -r requirements.txt && cd ..
+cd frontend && npm install && cd ..
+
+# 2. Start Backend (Terminal 1)
 cd backend
-pip install -r requirements.txt
 USE_SQLITE=true python -m uvicorn app.main:app --host 0.0.0.0 --port 8001 --reload
 
-# Terminal 2: Start Frontend
+# 3. Start Frontend (Terminal 2)
 cd frontend
-npm install
 NEXT_PUBLIC_API_URL=http://localhost:8001 npm run dev
+
+# 4. Open http://localhost:3000
 ```
+
+**Note:** The repository includes a pre-populated SQLite database with MuM trial data, so the app works immediately after starting the servers.
 
 ### Option B: Docker (Neo4j mode)
 
@@ -45,7 +51,9 @@ docker compose up -d --build
 
 Wait ~30 seconds for all services to initialize.
 
-### Ingest Data
+### Ingest Data (Optional)
+
+The repository includes a pre-populated database. To refresh data or load a different indication:
 
 ```bash
 # For SQLite mode (port 8001)
