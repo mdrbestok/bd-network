@@ -8,8 +8,6 @@ import type { TrialFilter } from '@/lib/api';
 interface GraphControlsProps {
   trialFilter: TrialFilter;
   onTrialFilterChange: (filter: TrialFilter) => void;
-  showTrialSponsors: boolean;
-  onShowTrialSponsorsChange: (show: boolean) => void;
   includeSites: boolean;
   onIncludeSitesChange: (include: boolean) => void;
   pinOnDrag: boolean;
@@ -32,8 +30,6 @@ const TRIAL_FILTER_OPTIONS: { value: TrialFilter; label: string }[] = [
 export default function GraphControls({
   trialFilter,
   onTrialFilterChange,
-  showTrialSponsors,
-  onShowTrialSponsorsChange,
   includeSites,
   onIncludeSitesChange,
   pinOnDrag,
@@ -102,28 +98,6 @@ export default function GraphControls({
           </select>
         </div>
 
-        {/* Show trial-sponsor edges toggle (only when trials are shown) */}
-        {trialFilter !== 'none' && (
-          <div className="flex items-center justify-between pl-3 border-l-2 border-gray-200">
-            <label className="text-xs text-gray-600" title="Show dotted lines from trials to their sponsors">
-              Trial → Sponsor Links
-            </label>
-            <button
-              onClick={() => onShowTrialSponsorsChange(!showTrialSponsors)}
-              className={cn(
-                'relative w-10 h-5 rounded-full transition-colors',
-                showTrialSponsors ? 'bg-blue-500' : 'bg-gray-300'
-              )}
-            >
-              <div
-                className={cn(
-                  'absolute top-0.5 w-4 h-4 bg-white rounded-full transition-transform shadow',
-                  showTrialSponsors ? 'translate-x-5' : 'translate-x-0.5'
-                )}
-              />
-            </button>
-          </div>
-        )}
 
         {/* Pin on drag toggle */}
         <div className="flex items-center justify-between">

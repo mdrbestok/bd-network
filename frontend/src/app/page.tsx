@@ -198,7 +198,6 @@ export default function NetworkPage() {
   // Control state
   const [indication, setIndication] = useState('MuM');
   const [trialFilter, setTrialFilter] = useState<TrialFilter>('none');
-  const [showTrialSponsors, setShowTrialSponsors] = useState(false); // Hide trial-sponsor edges by default
   const [includeSites, setIncludeSites] = useState(false); // Default: industry only (sites off)
   const [pinOnDrag, setPinOnDrag] = useState(true); // Default to pinning nodes when dragged
   const [selectedPhases, setSelectedPhases] = useState<string[]>([]);
@@ -254,11 +253,16 @@ export default function NetworkPage() {
       };
     }
     
-    // Filter out trial-sponsor edges if disabled
-    if (!showTrialSponsors) {
+    // Site-trial edges (PARTICIPATES_IN_TRIAL, SPONSORS_TRIAL) are only kept when includeSites is ON
+    // With the new data model:
+    // - Industry sponsors connect via: Sponsor -> OWNS/DEVELOPS -> Asset -> HAS_TRIAL -> Trial (indirect)
+    // - Sites connect via: Site -> PARTICIPATES_IN_TRIAL/SPONSORS_TRIAL -> Trial (direct)
+    if (!includeSites) {
       data = {
         nodes: data.nodes,
-        edges: data.edges.filter((e) => e.type !== 'SPONSORS_TRIAL')
+        edges: data.edges.filter((e) => 
+          e.type !== 'SPONSORS_TRIAL' && e.type !== 'PARTICIPATES_IN_TRIAL'
+        )
       };
     }
     
@@ -270,7 +274,7 @@ export default function NetworkPage() {
     }
     
     return data;
-  }, [fullGraphData, focusedNodeId, focusHops, includeSites, showTrialSponsors]);
+  }, [fullGraphData, focusedNodeId, focusHops, includeSites]);
 
   // Get the focused node label for display
   const focusedNodeLabel = useMemo(() => {
@@ -410,6 +414,11 @@ export default function NetworkPage() {
     // Set focus to this node
     setFocusedNodeId(node.id);
     setHighlightedNodeId(node.id);
+    
+    // When focusing on an asset, auto-enable trials so they're visible at 1 hop
+    if (node.type === 'asset' && trialFilter === 'none') {
+      setTrialFilter('all');
+    }
     
     // Open drawer with details
     setSelectedNode(node);
@@ -821,10 +830,14 @@ export default function NetworkPage() {
           <GraphControls
             trialFilter={trialFilter}
             onTrialFilterChange={setTrialFilter}
-            showTrialSponsors={showTrialSponsors}
-            onShowTrialSponsorsChange={setShowTrialSponsors}
             includeSites={includeSites}
-            onIncludeSitesChange={setIncludeSites}
+            onIncludeSitesChange={(value) => {
+              setIncludeSites(value);
+              // When enabling sites, also show trials (sites connect to trials)
+              if (value && trialFilter === 'none') {
+                setTrialFilter('all');
+              }
+            }}
             pinOnDrag={pinOnDrag}
             onPinOnDragChange={setPinOnDrag}
             phases={availablePhases}

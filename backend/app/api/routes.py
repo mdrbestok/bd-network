@@ -62,6 +62,7 @@ class AssetUpdateRequest(BaseModel):
     targets: Optional[List[str]] = None
     owner_company_id: Optional[str] = None
     owner_company_name: Optional[str] = None  # If set, create/lookup company by name then set as owner
+    relationship_type: Optional[str] = None  # owns, licenses, uses_as_comparator
 
 
 class CompanyCreateRequest(BaseModel):
@@ -242,6 +243,7 @@ async def update_asset(asset_id: str, body: AssetUpdateRequest):
     - targets: list of molecular targets
     - owner_company_id: set/confirm owner by company_id
     - owner_company_name: set/confirm owner by name (creates company if new)
+    - relationship_type: owns, licenses, or uses_as_comparator
     """
     try:
         graph_service = get_graph_service()
@@ -254,6 +256,7 @@ async def update_asset(asset_id: str, body: AssetUpdateRequest):
             modality=body.modality,
             targets=body.targets,
             owner_company_id=owner_company_id,
+            relationship_type=body.relationship_type,
         )
         if not result:
             raise HTTPException(status_code=404, detail="Asset not found or update not supported")

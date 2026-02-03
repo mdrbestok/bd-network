@@ -46,7 +46,10 @@ export const nodeColorsBorder: Record<NodeType, string> = {
 export const edgeStyles: Record<string, { color: string; dashed: boolean }> = {
   OWNS: { color: '#6b7280', dashed: false },
   DEVELOPS: { color: '#3b82f6', dashed: false }, // Blue for company-asset via trial
-  SPONSORS_TRIAL: { color: '#9ca3af', dashed: true },
+  LICENSES: { color: '#8b5cf6', dashed: false }, // Purple for licensing
+  USES_AS_COMPARATOR: { color: '#f97316', dashed: true }, // Orange dashed for comparator
+  SPONSORS_TRIAL: { color: '#9ca3af', dashed: true }, // Legacy - sites connected to trials
+  PARTICIPATES_IN_TRIAL: { color: '#9ca3af', dashed: true }, // Sites participating in trials
   HAS_TRIAL: { color: '#d1d5db', dashed: true },
   PARTY_TO: { color: '#a855f7', dashed: false },
   COVERS: { color: '#22c55e', dashed: false },

@@ -12,7 +12,7 @@ from contextlib import contextmanager
 from datetime import datetime, date
 
 from ..models.nodes import Company, Asset, Deal, Document, Trial
-from ..models.edges import PartyTo, Covers, SupportedBy, Owns, HasTrial, SponsorsTrial, EdgeEvidence
+from ..models.edges import PartyTo, Covers, SupportedBy, Owns, HasTrial, SponsorsTrial, ParticipatesInTrial, Licenses, UsesAsComparator, EdgeEvidence
 
 logger = logging.getLogger(__name__)
 
@@ -226,6 +226,41 @@ class SQLiteService:
                     asset_id TEXT,
                     evidence TEXT,
                     PRIMARY KEY (deal_id, asset_id)
+                )
+            """)
+            
+            # New edge tables for corrected data model
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS participates_in_trial (
+                    company_id TEXT,
+                    trial_id TEXT,
+                    role TEXT,
+                    evidence TEXT,
+                    PRIMARY KEY (company_id, trial_id)
+                )
+            """)
+            
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS licenses (
+                    company_id TEXT,
+                    asset_id TEXT,
+                    from_date TEXT,
+                    to_date TEXT,
+                    territory TEXT,
+                    confidence REAL,
+                    source TEXT,
+                    evidence TEXT,
+                    PRIMARY KEY (company_id, asset_id)
+                )
+            """)
+            
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS uses_as_comparator (
+                    company_id TEXT,
+                    asset_id TEXT,
+                    trial_id TEXT,
+                    evidence TEXT,
+                    PRIMARY KEY (company_id, asset_id, trial_id)
                 )
             """)
             
@@ -447,10 +482,19 @@ class SQLiteService:
                     json.dumps([e.model_dump() for e in rel.evidence], default=json_serial)
                 ))
 
+    def _clear_company_asset_relationships(self, company_id: str, asset_id: str, cursor) -> None:
+        """Remove all existing relationships between a company and asset (used before setting a new one)."""
+        cursor.execute("DELETE FROM owns WHERE company_id = ? AND asset_id = ?", (company_id, asset_id))
+        cursor.execute("DELETE FROM licenses WHERE company_id = ? AND asset_id = ?", (company_id, asset_id))
+        cursor.execute("DELETE FROM uses_as_comparator WHERE company_id = ? AND asset_id = ?", (company_id, asset_id))
+
     def upsert_owns_user_confirmed(self, company_id: str, asset_id: str, confidence: float = 1.0) -> None:
-        """Set or confirm ownership of an asset by a company. ClinicalTrials.gov ingestion will not overwrite this."""
+        """Set or confirm ownership of an asset by a company. Replaces any other relationship types."""
         with self.connection() as conn:
             cursor = conn.cursor()
+            # Remove any other relationship types first
+            self._clear_company_asset_relationships(company_id, asset_id, cursor)
+            
             rel = Owns(
                 company_id=company_id,
                 asset_id=asset_id,
@@ -473,6 +517,45 @@ class SQLiteService:
                 json.dumps([e.model_dump() for e in rel.evidence], default=json_serial),
                 rel.confidence,
                 json.dumps([e.model_dump() for e in rel.evidence], default=json_serial)
+            ))
+
+    def upsert_licenses_user_confirmed(self, company_id: str, asset_id: str, confidence: float = 1.0) -> None:
+        """Set a license relationship. Replaces any other relationship types."""
+        with self.connection() as conn:
+            cursor = conn.cursor()
+            # Remove any other relationship types first
+            self._clear_company_asset_relationships(company_id, asset_id, cursor)
+            
+            cursor.execute("""
+                INSERT INTO licenses (company_id, asset_id, from_date, to_date, territory, confidence, source, evidence)
+                VALUES (?, ?, NULL, NULL, NULL, ?, 'user_confirmed', ?)
+                ON CONFLICT(company_id, asset_id) DO UPDATE SET confidence = ?, source = 'user_confirmed', evidence = ?
+            """, (
+                company_id,
+                asset_id,
+                confidence,
+                json.dumps([{"source_type": "user_confirmed", "confidence": confidence}]),
+                confidence,
+                json.dumps([{"source_type": "user_confirmed", "confidence": confidence}])
+            ))
+
+    def upsert_uses_as_comparator_user_confirmed(self, company_id: str, asset_id: str, trial_id: str = "user_set") -> None:
+        """Set a uses_as_comparator relationship. Replaces any other relationship types."""
+        with self.connection() as conn:
+            cursor = conn.cursor()
+            # Remove any other relationship types first
+            self._clear_company_asset_relationships(company_id, asset_id, cursor)
+            
+            cursor.execute("""
+                INSERT INTO uses_as_comparator (company_id, asset_id, trial_id, evidence)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(company_id, asset_id, trial_id) DO UPDATE SET evidence = ?
+            """, (
+                company_id,
+                asset_id,
+                trial_id,
+                json.dumps([{"source_type": "user_confirmed", "confidence": 1.0}]),
+                json.dumps([{"source_type": "user_confirmed", "confidence": 1.0}])
             ))
     
     def create_party_to(self, rel: PartyTo):
@@ -499,6 +582,53 @@ class SQLiteService:
             """, (
                 rel.deal_id,
                 rel.asset_id,
+                json.dumps([e.model_dump() for e in rel.evidence], default=json_serial)
+            ))
+    
+    def create_participates_in_trial(self, rel: ParticipatesInTrial):
+        """Create PARTICIPATES_IN_TRIAL relationship (for sites, investigators, academic centers)."""
+        with self.connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                INSERT OR REPLACE INTO participates_in_trial (company_id, trial_id, role, evidence)
+                VALUES (?, ?, ?, ?)
+            """, (
+                rel.company_id,
+                rel.trial_id,
+                rel.role,
+                json.dumps([e.model_dump() for e in rel.evidence], default=json_serial)
+            ))
+    
+    def create_licenses(self, rel: Licenses):
+        """Create LICENSES relationship."""
+        with self.connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                INSERT OR REPLACE INTO licenses 
+                (company_id, asset_id, from_date, to_date, territory, confidence, source, evidence)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                rel.company_id,
+                rel.asset_id,
+                str(rel.from_date) if rel.from_date else None,
+                str(rel.to_date) if rel.to_date else None,
+                rel.territory,
+                rel.confidence,
+                rel.source,
+                json.dumps([e.model_dump() for e in rel.evidence], default=json_serial)
+            ))
+    
+    def create_uses_as_comparator(self, rel: UsesAsComparator):
+        """Create USES_AS_COMPARATOR relationship (for comparator drugs in trials)."""
+        with self.connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                INSERT OR REPLACE INTO uses_as_comparator (company_id, asset_id, trial_id, evidence)
+                VALUES (?, ?, ?, ?)
+            """, (
+                rel.company_id,
+                rel.asset_id,
+                rel.trial_id,
                 json.dumps([e.model_dump() for e in rel.evidence], default=json_serial)
             ))
     
@@ -627,7 +757,8 @@ class SQLiteService:
             """, (asset_id,))
             asset['trials'] = [self._row_to_dict(row) for row in cursor.fetchall()]
             
-            # Get owners (include user_confirmed)
+            # Get all company relationships for this asset
+            # 1. Owners
             cursor.execute("""
                 SELECT c.*, o.confidence, o.source as ownership_source, o.user_confirmed
                 FROM companies c
@@ -637,12 +768,93 @@ class SQLiteService:
             asset['owners'] = []
             for row in cursor.fetchall():
                 owner = self._row_to_dict(row)
-                owner['ownership'] = {
+                owner['relationship'] = {
+                    'type': 'owns',
                     'confidence': row['confidence'],
                     'source': row['ownership_source'],
                     'user_confirmed': bool(row['user_confirmed']) if 'user_confirmed' in row.keys() and row['user_confirmed'] else False
                 }
+                # Keep legacy 'ownership' key for backwards compatibility
+                owner['ownership'] = owner['relationship']
                 asset['owners'].append(owner)
+            
+            # 2. Licensees
+            cursor.execute("""
+                SELECT c.*, l.confidence, l.source, l.territory
+                FROM companies c
+                JOIN licenses l ON c.company_id = l.company_id
+                WHERE l.asset_id = ?
+            """, (asset_id,))
+            asset['licensees'] = []
+            for row in cursor.fetchall():
+                licensee = self._row_to_dict(row)
+                licensee['relationship'] = {
+                    'type': 'licenses',
+                    'confidence': row['confidence'],
+                    'source': row['source'],
+                    'territory': row['territory']
+                }
+                asset['licensees'].append(licensee)
+            
+            # 3. Comparator users
+            cursor.execute("""
+                SELECT c.*, u.trial_id
+                FROM companies c
+                JOIN uses_as_comparator u ON c.company_id = u.company_id
+                WHERE u.asset_id = ?
+            """, (asset_id,))
+            asset['comparator_users'] = []
+            for row in cursor.fetchall():
+                user = self._row_to_dict(row)
+                user['relationship'] = {
+                    'type': 'uses_as_comparator',
+                    'trial_id': row['trial_id']
+                }
+                asset['comparator_users'].append(user)
+            
+            # 4. Sites that participate in trials for this asset
+            cursor.execute("""
+                SELECT DISTINCT c.*
+                FROM companies c
+                JOIN participates_in_trial pit ON c.company_id = pit.company_id
+                JOIN has_trial ht ON pit.trial_id = ht.trial_id
+                WHERE ht.asset_id = ?
+            """, (asset_id,))
+            asset['trial_sites'] = []
+            for row in cursor.fetchall():
+                site = self._row_to_dict(row)
+                site['relationship'] = {
+                    'type': 'participates_in_trial'
+                }
+                asset['trial_sites'].append(site)
+            
+            # Also get sites from legacy sponsors_trial table (non-industry)
+            cursor.execute("""
+                SELECT DISTINCT c.*
+                FROM companies c
+                JOIN sponsors_trial st ON c.company_id = st.company_id
+                JOIN has_trial ht ON st.trial_id = ht.trial_id
+                WHERE ht.asset_id = ? AND c.company_type != 'industry'
+            """, (asset_id,))
+            seen_site_ids = {s['company_id'] for s in asset['trial_sites']}
+            for row in cursor.fetchall():
+                site = self._row_to_dict(row)
+                if site['company_id'] not in seen_site_ids:
+                    site['relationship'] = {
+                        'type': 'participates_in_trial'
+                    }
+                    asset['trial_sites'].append(site)
+            
+            # Combined list of all connected companies with their relationship types
+            asset['connected_companies'] = []
+            for owner in asset['owners']:
+                asset['connected_companies'].append({**owner, 'relationship_type': 'owns'})
+            for licensee in asset['licensees']:
+                asset['connected_companies'].append({**licensee, 'relationship_type': 'licenses'})
+            for user in asset['comparator_users']:
+                asset['connected_companies'].append({**user, 'relationship_type': 'uses_as_comparator'})
+            for site in asset['trial_sites']:
+                asset['connected_companies'].append({**site, 'relationship_type': 'participates_in_trial'})
             
             return asset
     
@@ -793,12 +1005,12 @@ class SQLiteService:
                         "data": trial
                     })
                 
-                # Get companies sponsoring this trial
+                # Get sites/investigators participating in this trial (non-industry)
                 cursor.execute("""
-                    SELECT c.*, st.role
+                    SELECT c.*, pit.role
                     FROM companies c
-                    JOIN sponsors_trial st ON c.company_id = st.company_id
-                    WHERE st.trial_id = ?
+                    JOIN participates_in_trial pit ON c.company_id = pit.company_id
+                    WHERE pit.trial_id = ?
                 """, (trial_id,))
                 
                 for company_row in cursor.fetchall():
@@ -815,6 +1027,42 @@ class SQLiteService:
                         })
                     
                     if trial_in_scope:
+                        edge_id = f"{company_id}-participates-{trial_id}"
+                        if edge_id not in seen_edges:
+                            seen_edges.add(edge_id)
+                            edges.append({
+                                "id": edge_id,
+                                "source": company_id,
+                                "target": trial_id,
+                                "type": "PARTICIPATES_IN_TRIAL",
+                                "label": company_row['role'] or "site",
+                                "data": {"role": company_row['role']}
+                            })
+                
+                # Also check old sponsors_trial for backwards compatibility during migration
+                cursor.execute("""
+                    SELECT c.*, st.role
+                    FROM companies c
+                    JOIN sponsors_trial st ON c.company_id = st.company_id
+                    WHERE st.trial_id = ?
+                """, (trial_id,))
+                
+                for company_row in cursor.fetchall():
+                    company = self._row_to_dict(company_row)
+                    company_id = company['company_id']
+                    company_type = company.get('company_type', 'industry')
+                    
+                    if company_id not in seen_nodes:
+                        seen_nodes.add(company_id)
+                        nodes.append({
+                            "id": company_id,
+                            "type": "company",
+                            "label": company.get('name', company_id),
+                            "data": company
+                        })
+                    
+                    # Only create SPONSORS_TRIAL edge for non-industry (sites) - industry connects through assets
+                    if trial_in_scope and company_type != 'industry':
                         edge_id = f"{company_id}-sponsors-{trial_id}"
                         if edge_id not in seen_edges:
                             seen_edges.add(edge_id)
@@ -823,11 +1071,11 @@ class SQLiteService:
                                 "source": company_id,
                                 "target": trial_id,
                                 "type": "SPONSORS_TRIAL",
-                                "label": company_row['role'] or "sponsor",
+                                "label": company_row['role'] or "site",
                                 "data": {"role": company_row['role']}
                             })
                 
-                # Lead sponsors that are industry only (for DEVELOPS → asset). Sites/academic stay connected only to trials.
+                # Industry sponsors are found through asset ownership, not direct trial links
                 lead_sponsor_ids = []
                 cursor.execute("""
                     SELECT st.company_id
@@ -1076,6 +1324,9 @@ class SQLiteService:
             cursor.execute("DELETE FROM owns")
             cursor.execute("DELETE FROM party_to")
             cursor.execute("DELETE FROM covers")
+            cursor.execute("DELETE FROM participates_in_trial")
+            cursor.execute("DELETE FROM licenses")
+            cursor.execute("DELETE FROM uses_as_comparator")
             cursor.execute("DELETE FROM companies")
             cursor.execute("DELETE FROM assets")
             cursor.execute("DELETE FROM trials")

@@ -58,8 +58,36 @@ class HasTrial(BaseModel):
 
 
 class SponsorsTrial(BaseModel):
-    """(Company)-[:SPONSORS_TRIAL {role}]->(Trial)"""
+    """(Company)-[:SPONSORS_TRIAL {role}]->(Trial) - DEPRECATED: Use ParticipatesInTrial for sites"""
     company_id: str
     trial_id: str
     role: str  # lead_sponsor, collaborator
+    evidence: List[EdgeEvidence] = Field(default_factory=list)
+
+
+class ParticipatesInTrial(BaseModel):
+    """(Company/Site)-[:PARTICIPATES_IN_TRIAL {role}]->(Trial) - For clinical sites, investigators, academic centers"""
+    company_id: str
+    trial_id: str
+    role: str  # site, investigator, collaborator
+    evidence: List[EdgeEvidence] = Field(default_factory=list)
+
+
+class Licenses(BaseModel):
+    """(Company)-[:LICENSES {from,to,territory}]->(Asset) - Licensing relationship"""
+    company_id: str
+    asset_id: str
+    from_date: Optional[date] = None
+    to_date: Optional[date] = None
+    territory: Optional[str] = None  # e.g., "worldwide", "US", "ex-US"
+    confidence: float = 1.0
+    source: str = "inferred"
+    evidence: List[EdgeEvidence] = Field(default_factory=list)
+
+
+class UsesAsComparator(BaseModel):
+    """(Company)-[:USES_AS_COMPARATOR]->(Asset) - Drug used as comparator in trial, not owned"""
+    company_id: str
+    asset_id: str
+    trial_id: str  # Which trial this comparator use is for
     evidence: List[EdgeEvidence] = Field(default_factory=list)

@@ -10,7 +10,7 @@ from urllib.parse import urlencode
 
 from ..config import settings
 from ..models.nodes import Company, Asset, Trial, Document, Evidence
-from ..models.edges import SponsorsTrial, HasTrial, Owns, EdgeEvidence
+from ..models.edges import SponsorsTrial, HasTrial, Owns, ParticipatesInTrial, UsesAsComparator, EdgeEvidence
 
 logger = logging.getLogger(__name__)
 
@@ -285,13 +285,13 @@ class ClinicalTrialsService:
                     
                     company_id = Company.generate_id(sponsor_name)
                     
+                    # Determine company type
+                    # Lead sponsors use the sponsor class, collaborators infer from name
+                    is_lead = i < len(sponsors)
+                    sponsor_class_for_inference = lead_sponsor_class if is_lead else None
+                    company_type = Company.infer_type_from_name(sponsor_name, sponsor_class_for_inference)
+                    
                     if company_id not in seen_companies:
-                        # Determine company type
-                        # Lead sponsors use the sponsor class, collaborators infer from name
-                        is_lead = i < len(sponsors)
-                        sponsor_class_for_inference = lead_sponsor_class if is_lead else None
-                        company_type = Company.infer_type_from_name(sponsor_name, sponsor_class_for_inference)
-                        
                         company = Company(
                             company_id=company_id,
                             name=sponsor_name,
@@ -307,19 +307,38 @@ class ClinicalTrialsService:
                         seen_companies.add(company_id)
                         stats["companies"] += 1
                     
-                    # Create sponsor relationship
-                    role = "lead_sponsor" if i < len(sponsors) else "collaborator"
-                    rel = SponsorsTrial(
-                        company_id=company_id,
-                        trial_id=trial.trial_id,
-                        role=role,
-                        evidence=[EdgeEvidence(
-                            source_type="clinicaltrials",
-                            source_url=trial.source_url,
-                            source_id=trial.trial_id
-                        )]
-                    )
-                    neo4j_service.create_sponsors_trial(rel)
+                    role = "lead_sponsor" if is_lead else "collaborator"
+                    
+                    # NEW DATA MODEL:
+                    # - Industry sponsors connect to trials INDIRECTLY through assets (OWNS -> Asset -> HAS_TRIAL -> Trial)
+                    # - Sites/academic/investigators connect DIRECTLY via PARTICIPATES_IN_TRIAL
+                    if company_type == 'industry':
+                        # Industry sponsors: keep SPONSORS_TRIAL for backwards compat but don't rely on it
+                        # Their main connection is through OWNS/DEVELOPS -> Asset
+                        rel = SponsorsTrial(
+                            company_id=company_id,
+                            trial_id=trial.trial_id,
+                            role=role,
+                            evidence=[EdgeEvidence(
+                                source_type="clinicaltrials",
+                                source_url=trial.source_url,
+                                source_id=trial.trial_id
+                            )]
+                        )
+                        neo4j_service.create_sponsors_trial(rel)
+                    else:
+                        # Sites, academic, investigators: use PARTICIPATES_IN_TRIAL
+                        rel = ParticipatesInTrial(
+                            company_id=company_id,
+                            trial_id=trial.trial_id,
+                            role="site" if company_type in ('academic', 'site') else role,
+                            evidence=[EdgeEvidence(
+                                source_type="clinicaltrials",
+                                source_url=trial.source_url,
+                                source_id=trial.trial_id
+                            )]
+                        )
+                        neo4j_service.create_participates_in_trial(rel)
                     stats["sponsor_relations"] += 1
                 
                 # Process interventions as assets
@@ -390,9 +409,9 @@ class ClinicalTrialsService:
                     neo4j_service.create_has_trial(has_trial)
                     stats["asset_trial_relations"] += 1
                     
-                    # Improved ownership logic:
-                    # Only attribute ownership if drug is proprietary to the lead sponsor
-                    # (not for comparator drugs or generics used in the trial)
+                    # Improved ownership/relationship logic:
+                    # - Proprietary drugs: create OWNS relationship
+                    # - Comparator drugs: create USES_AS_COMPARATOR relationship
                     if sponsors:
                         lead_sponsor_name = sponsors[0]
                         lead_sponsor_id = Company.generate_id(lead_sponsor_name)
@@ -405,6 +424,8 @@ class ClinicalTrialsService:
                         
                         # Also check if there's a known owner that matches
                         known_owner = known_info.get("known_owner")
+                        is_generic = known_info.get("is_generic", False)
+                        
                         if known_owner:
                             # If we know the owner, only create ownership if it matches
                             owner_normalized = normalization_service.normalize_company_name(known_owner)
@@ -412,10 +433,11 @@ class ClinicalTrialsService:
                             is_proprietary = owner_normalized.lower() == sponsor_normalized.lower()
                         
                         if is_proprietary:
+                            # Sponsor owns this asset
                             owns = Owns(
                                 company_id=lead_sponsor_id,
                                 asset_id=asset_id,
-                                confidence=0.9 if known_owner else 0.7,  # Higher confidence if from known data
+                                confidence=0.9 if known_owner else 0.7,
                                 source="confirmed_owner" if known_owner else "inferred_from_trial",
                                 is_current=True,
                                 evidence=[EdgeEvidence(
@@ -427,6 +449,25 @@ class ClinicalTrialsService:
                             )
                             neo4j_service.create_owns(owns)
                             stats["ownership_relations"] += 1
+                        elif not is_generic and known_owner:
+                            # Non-generic drug owned by someone else - it's a comparator
+                            # BUT only create this relationship for industry sponsors
+                            # Sites/academic don't "use comparators" - they participate in trials
+                            lead_sponsor_type = Company.infer_type_from_name(lead_sponsor_name, lead_sponsor_class)
+                            if lead_sponsor_type == 'industry':
+                                uses_comparator = UsesAsComparator(
+                                    company_id=lead_sponsor_id,
+                                    asset_id=asset_id,
+                                    trial_id=trial.trial_id,
+                                    evidence=[EdgeEvidence(
+                                        source_type="inferred_comparator",
+                                        source_url=trial.source_url,
+                                        source_id=trial.trial_id,
+                                        confidence=0.8
+                                    )]
+                                )
+                                neo4j_service.create_uses_as_comparator(uses_comparator)
+                                stats["ownership_relations"] += 1
                 
             except Exception as e:
                 logger.error(f"Error processing trial: {e}")

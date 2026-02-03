@@ -305,6 +305,7 @@ function AssetDetails({
   const [ownerSearchResults, setOwnerSearchResults] = useState<{ company_id: string; name: string }[]>([]);
   const [selectedOwnerId, setSelectedOwnerId] = useState<string | null>(null);
   const [newOwnerName, setNewOwnerName] = useState('');
+  const [relationshipType, setRelationshipType] = useState('owns');
   const [saveError, setSaveError] = useState<string | null>(null);
 
   useEffect(() => {
@@ -330,11 +331,23 @@ function AssetDetails({
     setSaveError(null);
     setSaving(true);
     try {
-      const payload: { modality?: string; targets?: string[]; owner_company_id?: string; owner_company_name?: string } = {};
+      const payload: { 
+        modality?: string; 
+        targets?: string[]; 
+        owner_company_id?: string; 
+        owner_company_name?: string;
+        relationship_type?: string;
+      } = {};
       if (editModality.trim()) payload.modality = editModality.trim();
       if (editTargets.length) payload.targets = editTargets;
-      if (selectedOwnerId) payload.owner_company_id = selectedOwnerId;
-      if (newOwnerName.trim()) payload.owner_company_name = newOwnerName.trim();
+      if (selectedOwnerId) {
+        payload.owner_company_id = selectedOwnerId;
+        payload.relationship_type = relationshipType;
+      }
+      if (newOwnerName.trim()) {
+        payload.owner_company_name = newOwnerName.trim();
+        payload.relationship_type = relationshipType;
+      }
       await updateAsset(assetId, payload);
       if (onRefreshEntity) await onRefreshEntity();
       setEditing(false);
@@ -396,60 +409,119 @@ function AssetDetails({
         </div>
       )}
 
-      {data.owners?.length > 0 && (
-        <div>
-          <p className="text-xs text-gray-500 uppercase font-medium mb-2">
-            Owners <span className="text-blue-500 font-normal">— click to focus</span>
-          </p>
-          <div className="space-y-2">
-            {data.owners.map((owner: any) => (
-              <div
-                key={owner.company_id}
-                className="flex items-center gap-2 w-full bg-blue-50 hover:bg-blue-100 rounded p-2"
-              >
-                <button
-                  type="button"
-                  onClick={() => onNavigateToNode?.(owner.company_id, 'company')}
-                  className="flex-1 flex items-center justify-between text-left min-w-0"
-                >
-                  <div className="flex items-center space-x-2 min-w-0">
-                    <Building2 className="w-4 h-4 text-blue-500 flex-shrink-0" />
-                    <span className="text-sm text-blue-600 hover:underline truncate">{owner.name}</span>
-                    {owner.ownership?.user_confirmed && (
-                      <span className="text-xs bg-green-100 text-green-700 px-1.5 py-0.5 rounded flex-shrink-0">Confirmed</span>
-                    )}
-                  </div>
-                  {owner.ownership?.confidence && !owner.ownership?.user_confirmed && (
-                    <span className="text-xs text-gray-400 flex-shrink-0 ml-1">{formatConfidence(owner.ownership.confidence)}</span>
-                  )}
-                </button>
-                {!owner.ownership?.user_confirmed && (
-                  <button
-                    type="button"
-                    onClick={async () => {
-                      try {
-                        await updateAsset(assetId, { owner_company_id: owner.company_id });
-                        onRefreshEntity?.();
-                      } catch (e) {
-                        setSaveError(e instanceof Error ? e.message : 'Confirm failed');
-                      }
-                    }}
-                    className="flex-shrink-0 text-xs font-medium text-green-700 bg-green-100 hover:bg-green-200 px-2 py-1 rounded"
-                  >
-                    Confirm
-                  </button>
+      {/* Connected Companies (Industry) - owns, licenses, comparator */}
+      {(() => {
+        const allConnected = data.connected_companies || data.owners || [];
+        // Industry companies: owns, licenses, comparator relationships
+        const industryCompanies = allConnected.filter((c: any) => {
+          const relType = c.relationship_type || c.relationship?.type;
+          const isIndustry = c.company_type === 'industry' || !c.company_type;
+          const isIndustryRelation = relType === 'owns' || relType === 'licenses' || relType === 'uses_as_comparator';
+          return isIndustry && isIndustryRelation;
+        });
+        // Sites: participates_in_trial OR any non-industry company type
+        const sites = allConnected.filter((c: any) => {
+          const relType = c.relationship_type || c.relationship?.type;
+          const isNonIndustry = c.company_type && c.company_type !== 'industry';
+          const isSiteRelation = relType === 'participates_in_trial';
+          return isNonIndustry || isSiteRelation;
+        });
+        
+        return (
+          <>
+            {industryCompanies.length > 0 && (
+              <div>
+                <p className="text-xs text-gray-500 uppercase font-medium mb-2">
+                  Connected Companies <span className="text-blue-500 font-normal">— click to focus</span>
+                </p>
+                <div className="space-y-2">
+                  {industryCompanies.map((company: any) => {
+                    const relType = company.relationship_type || company.relationship?.type || 'owns';
+                    const relColors: Record<string, { bg: string; text: string; label: string }> = {
+                      owns: { bg: 'bg-blue-50', text: 'text-blue-700', label: 'Owns' },
+                      licenses: { bg: 'bg-purple-50', text: 'text-purple-700', label: 'Licenses' },
+                      uses_as_comparator: { bg: 'bg-orange-50', text: 'text-orange-700', label: 'Comparator' },
+                    };
+                    const colors = relColors[relType] || relColors.owns;
+                    
+                    return (
+                      <div
+                        key={`${company.company_id}-${relType}`}
+                        className={cn('flex items-center gap-2 w-full rounded p-2', colors.bg)}
+                      >
+                        <button
+                          type="button"
+                          onClick={() => onNavigateToNode?.(company.company_id, 'company')}
+                          className="flex-1 flex items-center justify-between text-left min-w-0"
+                        >
+                          <div className="flex items-center space-x-2 min-w-0">
+                            <Building2 className={cn('w-4 h-4 flex-shrink-0', colors.text)} />
+                            <span className={cn('text-sm hover:underline truncate', colors.text)}>{company.name}</span>
+                            <span className={cn('text-xs px-1.5 py-0.5 rounded flex-shrink-0', colors.bg, colors.text)}>
+                              {colors.label}
+                            </span>
+                            {company.relationship?.user_confirmed && (
+                              <span className="text-xs bg-green-100 text-green-700 px-1.5 py-0.5 rounded flex-shrink-0">✓</span>
+                            )}
+                          </div>
+                          {company.relationship?.confidence && !company.relationship?.user_confirmed && (
+                            <span className="text-xs text-gray-400 flex-shrink-0 ml-1">{formatConfidence(company.relationship.confidence)}</span>
+                          )}
+                        </button>
+                        {!company.relationship?.user_confirmed && relType === 'owns' && (
+                          <button
+                            type="button"
+                            onClick={async () => {
+                              try {
+                                await updateAsset(assetId, { owner_company_id: company.company_id });
+                                onRefreshEntity?.();
+                              } catch (e) {
+                                setSaveError(e instanceof Error ? e.message : 'Confirm failed');
+                              }
+                            }}
+                            className="flex-shrink-0 text-xs font-medium text-green-700 bg-green-100 hover:bg-green-200 px-2 py-1 rounded"
+                          >
+                            Confirm
+                          </button>
+                        )}
+                      </div>
+                    );
+                  })}
+                </div>
+                {!industryCompanies.some((c: any) => c.relationship?.user_confirmed || c.ownership?.user_confirmed) && (
+                  <p className="text-xs text-gray-400 mt-2 flex items-center">
+                    <AlertCircle className="w-3 h-3 mr-1" />
+                    Inferred from trials — click Confirm to lock ownership
+                  </p>
                 )}
               </div>
-            ))}
-          </div>
-          {!data.owners.some((o: any) => o.ownership?.user_confirmed) && (
-            <p className="text-xs text-gray-400 mt-2 flex items-center">
-              <AlertCircle className="w-3 h-3 mr-1" />
-              Inferred from trials — click Confirm to lock
-            </p>
-          )}
-        </div>
-      )}
+            )}
+            
+            {sites.length > 0 && (
+              <div className="mt-3">
+                <p className="text-xs text-gray-500 uppercase font-medium mb-2">
+                  Connected Sites <span className="text-gray-400 font-normal">— participate in trials</span>
+                </p>
+                <div className="flex flex-wrap gap-1.5">
+                  {sites.slice(0, 10).map((site: any) => (
+                    <button
+                      key={site.company_id}
+                      onClick={() => onNavigateToNode?.(site.company_id, 'company')}
+                      className="text-xs bg-gray-100 text-gray-600 hover:bg-gray-200 px-2 py-1 rounded cursor-pointer transition-colors"
+                      title={site.company_type}
+                    >
+                      {site.name}
+                    </button>
+                  ))}
+                  {sites.length > 10 && (
+                    <span className="text-xs text-gray-400 px-2 py-1">+{sites.length - 10} more</span>
+                  )}
+                </div>
+              </div>
+            )}
+          </>
+        );
+      })()}
 
       {/* Confirm / Edit section */}
       <div className="pt-4 border-t border-gray-200">
@@ -531,7 +603,7 @@ function AssetDetails({
               </div>
             </div>
             <div>
-              <label className="block text-xs text-gray-500 uppercase font-medium mb-1">Owner (confirm or set)</label>
+              <label className="block text-xs text-gray-500 uppercase font-medium mb-1">Company Relationship</label>
               <input
                 type="text"
                 value={ownerSearch}
@@ -565,13 +637,25 @@ function AssetDetails({
                 type="text"
                 value={newOwnerName}
                 onChange={(e) => setNewOwnerName(e.target.value)}
-                placeholder="Or add new sponsor by name"
-                className="w-full text-sm border border-gray-300 rounded-lg px-3 py-2"
+                placeholder="Or add new company by name"
+                className="w-full text-sm border border-gray-300 rounded-lg px-3 py-2 mb-2"
               />
               {(selectedOwnerId || newOwnerName.trim()) && (
-                <p className="text-xs text-green-600 mt-1">
-                  Will set/confirm owner on save
-                </p>
+                <>
+                  <label className="block text-xs text-gray-500 uppercase font-medium mb-1 mt-2">Relationship Type</label>
+                  <select
+                    value={relationshipType}
+                    onChange={(e) => setRelationshipType(e.target.value)}
+                    className="w-full text-sm border border-gray-300 rounded-lg px-3 py-2"
+                  >
+                    <option value="owns">Owns</option>
+                    <option value="licenses">Licenses</option>
+                    <option value="uses_as_comparator">Uses as Comparator</option>
+                  </select>
+                  <p className="text-xs text-green-600 mt-1">
+                    Will set company relationship on save
+                  </p>
+                </>
               )}
             </div>
             <div className="flex gap-2">

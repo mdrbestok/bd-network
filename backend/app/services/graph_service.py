@@ -95,14 +95,22 @@ class GraphService:
         modality: Optional[str] = None,
         targets: Optional[List[str]] = None,
         owner_company_id: Optional[str] = None,
+        relationship_type: Optional[str] = None,
     ) -> Optional[Dict[str, Any]]:
-        """Set user overrides for an asset (modality, targets) and/or confirm ownership. Ingestion will not overwrite these."""
+        """Set user overrides for an asset (modality, targets) and/or set company relationship. Ingestion will not overwrite these."""
         if not hasattr(self.db, 'set_asset_override'):
             return None
         if modality is not None or targets is not None:
             self.db.set_asset_override(asset_id, modality=modality, targets=targets)
         if owner_company_id is not None:
-            self.db.upsert_owns_user_confirmed(owner_company_id, asset_id, confidence=1.0)
+            rel_type = relationship_type or 'owns'
+            if rel_type == 'owns':
+                self.db.upsert_owns_user_confirmed(owner_company_id, asset_id, confidence=1.0)
+            elif rel_type == 'licenses':
+                self.db.upsert_licenses_user_confirmed(owner_company_id, asset_id, confidence=1.0)
+            elif rel_type == 'uses_as_comparator':
+                # For comparator, we need a trial_id - for user-set, use a placeholder
+                self.db.upsert_uses_as_comparator_user_confirmed(owner_company_id, asset_id)
         return self.get_asset_details(asset_id)
 
     def create_company(self, name: str) -> str:
