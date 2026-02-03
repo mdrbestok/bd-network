@@ -20,6 +20,14 @@ Items below are for planning and prioritization. Not all are scoped or scheduled
 
 ## Data quality & curation
 
+### Single relationship per company-asset pair (IN PROGRESS)
+- **Goal:** Each company should have only ONE relationship type with an asset (owns, licenses, or uses_as_comparator) — no duplicates.
+- **Status:** Code fix added to `sqlite_service.py` (`_clear_company_asset_relationships`) that clears other relationship types when setting a new one. 
+- **Remaining:** 
+  - Clean up existing duplicates in database (e.g., IDEAYA has both "owns" and "licenses" for darovasertib)
+  - Run: `DELETE FROM licenses WHERE company_id IN (SELECT company_id FROM companies WHERE name = 'IDEAYA Biosciences') AND asset_id IN (SELECT asset_id FROM assets WHERE name = 'darovasertib')`
+  - Consider adding a UI control to **change** existing relationship type (not just add new)
+
 ### Correct / approve assets and clinical sites
 - **Goals:**
   - Allow users to **correct** asset or site (e.g. modality, targets, owner) and have that preserved.
@@ -58,6 +66,7 @@ Items below are for planning and prioritization. Not all are scoped or scheduled
 
 - [ ] Startup animation (ball → expand → bounce) – deferred
 - [ ] Trial node colors: lighter orange (or muted) for not recruiting / not active
+- [x] Single relationship per company-asset pair (code done, needs data cleanup)
 - [ ] Correct / approve assets and clinical sites; add new assets and sites
 - [ ] Link to press release (or article) per deal
 - [ ] Deals model and UI: acquisitions, mergers, licensing; show with assets/sponsors and list of deals; multi-select two sponsors → show deals between them
