@@ -40,15 +40,14 @@ export default function NetworkGraph({
   height = 600,
 }: NetworkGraphProps) {
   const graphRef = useRef<any>(null);
+  const hasFitOnceRef = useRef(false);
   const [hoveredNode, setHoveredNode] = useState<string | null>(null);
-  const [isStabilized, setIsStabilized] = useState(false);
 
-  // Transform data for react-force-graph
+  // Static start: pass through node positions (library will assign if missing)
   const graphData = useMemo(() => ({
     nodes: data.nodes.map(node => {
-      // Don't copy fx/fy from source - let them be set fresh by pinOnDrag
-      const { fx, fy, ...rest } = node as any;
-      return { ...rest };
+      const { fx, fy, x, y, ...rest } = node as any;
+      return { ...rest, ...(x != null && y != null ? { x, y } : {}) };
     }),
     links: data.edges.map((edge) => ({
       ...edge,
@@ -57,9 +56,10 @@ export default function NetworkGraph({
     })),
   }), [data]);
 
-  // Reset stabilization state when refreshKey changes
+  // --- Animation / follow-zoom code commented out (static start) ---
+  // Reset fit-once when graph is refreshed
   useEffect(() => {
-    setIsStabilized(false);
+    hasFitOnceRef.current = false;
   }, [refreshKey]);
 
   // Configure force simulation for better layout
@@ -89,18 +89,12 @@ export default function NetworkGraph({
     }
   }, [graphData]);
 
-  // Zoom to fit after stabilization
-  useEffect(() => {
-    if (graphRef.current && data.nodes.length > 0 && isStabilized) {
-      setTimeout(() => {
-        graphRef.current.zoomToFit(400, 80);
-      }, 100);
-    }
-  }, [data, isStabilized]);
-
-  // Handle engine stop (stabilization complete)
+  // Static: one-time zoom to fit when simulation settles (no bounce, no follow)
   const handleEngineStop = useCallback(() => {
-    setIsStabilized(true);
+    if (graphRef.current && !hasFitOnceRef.current) {
+      hasFitOnceRef.current = true;
+      graphRef.current.zoomToFit(400, 80);
+    }
   }, []);
 
   // Highlight a specific node (from search)
@@ -266,7 +260,10 @@ export default function NetworkGraph({
   );
 
   return (
-    <div className="graph-container border border-gray-200 rounded-xl overflow-hidden bg-gradient-to-br from-slate-50 to-gray-100">
+    <div
+      className="graph-container border border-gray-200 rounded-xl overflow-hidden bg-gradient-to-br from-slate-50 to-gray-100"
+      style={{ width, height }}
+    >
       <ForceGraph2D
         key={refreshKey}
         ref={graphRef}

@@ -1,13 +1,36 @@
 'use client';
 
 import { useState, useEffect, useCallback, useMemo, useRef } from 'react';
+
+// Graph area dimensions (sidebar ~320px, padding, drawer possible)
+const SIDEBAR_WIDTH = 320;
+const PADDING_X = 32;
+const PADDING_Y = 128;
+
+function useGraphDimensions() {
+  const [dimensions, setDimensions] = useState({ width: 800, height: 600 });
+
+  useEffect(() => {
+    const update = () => {
+      setDimensions({
+        width: Math.max(400, window.innerWidth - SIDEBAR_WIDTH - PADDING_X),
+        height: Math.max(300, window.innerHeight - PADDING_Y),
+      });
+    };
+    update();
+    window.addEventListener('resize', update);
+    return () => window.removeEventListener('resize', update);
+  }, []);
+
+  return dimensions;
+}
 import { Search, RefreshCw, Database, AlertCircle, X, Focus, ArrowLeft, Link2 } from 'lucide-react';
 import NetworkGraph from '@/components/NetworkGraph';
 import DetailDrawer from '@/components/DetailDrawer';
 import GraphControls from '@/components/GraphControls';
 import GraphSearch from '@/components/GraphSearch';
 import type { GraphNode, GraphEdge, GraphData, Company, Asset, Trial } from '@/types';
-import { getIndicationGraph, getCompany, getAsset, getTrial, getHealth, ingestClinicalTrials } from '@/lib/api';
+import { getIndicationGraph, getCompany, getAsset, getTrial, getHealth, ingestClinicalTrials, type TrialFilter } from '@/lib/api';
 import { cn } from '@/lib/utils';
 
 // Helper to get edge endpoint IDs safely
@@ -159,6 +182,8 @@ function findShortestPath(
 }
 
 export default function NetworkPage() {
+  const graphDimensions = useGraphDimensions();
+
   // Full graph data (from API)
   const [fullGraphData, setFullGraphData] = useState<GraphData>({ nodes: [], edges: [] });
   const [loading, setLoading] = useState(true);
@@ -172,9 +197,9 @@ export default function NetworkPage() {
   
   // Control state
   const [indication, setIndication] = useState('MuM');
-  const [includeTrials, setIncludeTrials] = useState(false);
+  const [trialFilter, setTrialFilter] = useState<TrialFilter>('none');
   const [showTrialSponsors, setShowTrialSponsors] = useState(false); // Hide trial-sponsor edges by default
-  const [industryOnly, setIndustryOnly] = useState(true); // Default to industry only
+  const [includeSites, setIncludeSites] = useState(false); // Default: industry only (sites off)
   const [pinOnDrag, setPinOnDrag] = useState(true); // Default to pinning nodes when dragged
   const [selectedPhases, setSelectedPhases] = useState<string[]>([]);
   const [selectedModalities, setSelectedModalities] = useState<string[]>([]);
@@ -205,15 +230,20 @@ export default function NetworkPage() {
   // Compute displayed graph data (filtered by focus and industry type)
   const graphData = useMemo(() => {
     let data = fullGraphData;
-    
-    // Apply industry filter first
-    if (industryOnly) {
+
+    // When Include Sites is OFF, show only industry sponsors (filter out sites/academic).
+    // company_type is lowercase from backend; treat missing/undefined as non-industry so they show when Include Sites is ON.
+    if (!includeSites) {
       const industryNodeIds = new Set(
         data.nodes
-          .filter((n) => n.type !== 'company' || (n.data as any)?.company_type === 'industry')
+          .filter((n) => {
+            if (n.type !== 'company') return true;
+            const ct = (n.data as any)?.company_type;
+            return typeof ct === 'string' && ct.toLowerCase() === 'industry';
+          })
           .map((n) => n.id)
       );
-      
+
       data = {
         nodes: data.nodes.filter((n) => industryNodeIds.has(n.id)),
         edges: data.edges.filter((e) => {
@@ -232,13 +262,15 @@ export default function NetworkPage() {
       };
     }
     
-    // Apply focus filter
+    // Apply focus filter (only if focused node is in the graph, else show full graph)
     if (focusedNodeId) {
-      return getNodesWithinHops(focusedNodeId, data.nodes, data.edges, focusHops);
+      const focused = getNodesWithinHops(focusedNodeId, data.nodes, data.edges, focusHops);
+      // If focus yields no nodes (e.g. focused node not in current filter), show full graph so we don't show "No Data Yet"
+      if (focused.nodes.length > 0) return focused;
     }
     
     return data;
-  }, [fullGraphData, focusedNodeId, focusHops, industryOnly, showTrialSponsors]);
+  }, [fullGraphData, focusedNodeId, focusHops, includeSites, showTrialSponsors]);
 
   // Get the focused node label for display
   const focusedNodeLabel = useMemo(() => {
@@ -277,7 +309,7 @@ export default function NetworkPage() {
     try {
       const data = await getIndicationGraph(indication, {
         depth: 10, // Fetch all data, we filter client-side with hop distance
-        includeTrials,
+        trialFilter,
         phases: selectedPhases.length > 0 ? selectedPhases : undefined,
         modalities: selectedModalities.length > 0 ? selectedModalities : undefined,
       });
@@ -293,10 +325,11 @@ export default function NetworkPage() {
     } finally {
       setLoading(false);
     }
-  }, [indication, includeTrials, selectedPhases, selectedModalities, healthy]);
+  }, [indication, trialFilter, selectedPhases, selectedModalities, healthy]);
 
   // Track if this is the initial load (using ref to avoid re-renders)
   const hasLoadedOnceRef = useRef(false);
+  const prevIncludeSitesRef = useRef(includeSites);
 
   // Load graph on mount and when controls change
   useEffect(() => {
@@ -307,6 +340,14 @@ export default function NetworkPage() {
       hasLoadedOnceRef.current = true;
     }
   }, [loadGraph, healthy]);
+
+  // When user turns "Include Sites" ON, refetch so we have fresh graph data (with company_type for all nodes)
+  useEffect(() => {
+    if (includeSites && !prevIncludeSitesRef.current && hasLoadedOnceRef.current) {
+      loadGraph(true);
+    }
+    prevIncludeSitesRef.current = includeSites;
+  }, [includeSites, loadGraph]);
 
   // Handler for changing hop count - force graph refresh when decreasing
   const handleHopChange = useCallback((newHops: number) => {
@@ -385,12 +426,21 @@ export default function NetworkPage() {
       } else if (node.type === 'asset') {
         data = await getAsset(node.id);
       } else if (node.type === 'trial') {
-        data = await getTrial(node.id);
+        try {
+          data = await getTrial(node.id);
+        } catch {
+          // Fallback: use trial data from graph if API fails (e.g. trial not in DB)
+          data = (node.data as Trial) || null;
+        }
       }
       
       setEntityData(data);
     } catch (err) {
       console.error('Failed to load entity:', err);
+      // For trials, fall back to graph node data so drawer still shows something
+      if (node.type === 'trial' && node.data) {
+        setEntityData(node.data as Trial);
+      }
     } finally {
       setEntityLoading(false);
     }
@@ -769,12 +819,12 @@ export default function NetworkPage() {
 
           {/* Graph controls */}
           <GraphControls
-            includeTrials={includeTrials}
-            onIncludeTrialsChange={setIncludeTrials}
+            trialFilter={trialFilter}
+            onTrialFilterChange={setTrialFilter}
             showTrialSponsors={showTrialSponsors}
             onShowTrialSponsorsChange={setShowTrialSponsors}
-            industryOnly={industryOnly}
-            onIndustryOnlyChange={setIndustryOnly}
+            includeSites={includeSites}
+            onIncludeSitesChange={setIncludeSites}
             pinOnDrag={pinOnDrag}
             onPinOnDragChange={setPinOnDrag}
             phases={availablePhases}
@@ -889,6 +939,7 @@ export default function NetworkPage() {
             </div>
           ) : (
             <NetworkGraph
+              key={`${graphRefreshKey}-${includeSites ? 'sites' : 'industry'}`}
               data={graphData}
               onNodeClick={handleNodeClick}
               onEdgeClick={handleEdgeClick}
@@ -896,8 +947,8 @@ export default function NetworkPage() {
               selectedNodeIds={selectedNodes.map(n => n.id)}
               pinOnDrag={pinOnDrag}
               refreshKey={graphRefreshKey}
-              width={typeof window !== 'undefined' ? window.innerWidth - 420 : 800}
-              height={typeof window !== 'undefined' ? window.innerHeight - 160 : 600}
+              width={graphDimensions.width}
+              height={graphDimensions.height}
             />
           )}
         </div>
@@ -940,24 +991,70 @@ export default function NetworkPage() {
         edge={selectedEdge}
         entityData={entityData}
         loading={entityLoading}
+        onRefreshEntity={async () => {
+          if (!selectedNode) return;
+          setEntityLoading(true);
+          try {
+            let data: Company | Asset | Trial | null = null;
+            if (selectedNode.type === 'company') data = await getCompany(selectedNode.id);
+            else if (selectedNode.type === 'asset') data = await getAsset(selectedNode.id);
+            else if (selectedNode.type === 'trial') data = await getTrial(selectedNode.id);
+            setEntityData(data);
+          } catch (err) {
+            console.error('Refresh entity failed:', err);
+          } finally {
+            setEntityLoading(false);
+          }
+        }}
         onNavigateToNode={async (nodeId, nodeType) => {
           // Find the node in the full graph data
           let node = fullGraphData.nodes.find((n) => n.id === nodeId);
-          
+
           if (node) {
             // Node exists in current data, navigate directly
             handleNodeClick(node);
-          } else if (nodeType === 'trial' && !includeTrials) {
+          } else if (nodeType === 'trial' && trialFilter === 'none') {
             // Trial not loaded because "Include Trials" is off
             // Enable trials and set pending focus
             setPendingFocusNodeId(nodeId);
             setIncludeTrials(true);
           } else {
-            // Node not in current data - could be filtered out or doesn't exist
-            // Try to focus anyway (might not work if node isn't in graph)
-            console.log(`Node ${nodeId} not found in graph data`);
+            // Node not in graph (filtered out or not returned) - still open drawer and show entity
+            const syntheticNode: GraphNode = {
+              id: nodeId,
+              type: nodeType as GraphNode['type'],
+              label: nodeId,
+            };
+            setSelectedNodes([]);
             setFocusedNodeId(nodeId);
             setHighlightedNodeId(nodeId);
+            setSelectedNode(syntheticNode);
+            setSelectedEdge(null);
+            setDrawerOpen(true);
+            setEntityLoading(true);
+            setEntityData(null);
+            try {
+              let data: Company | Asset | Trial | null = null;
+              if (nodeType === 'company') data = await getCompany(nodeId);
+              else if (nodeType === 'asset') data = await getAsset(nodeId);
+              else if (nodeType === 'trial') {
+                try {
+                  data = await getTrial(nodeId);
+                } catch {
+                  data = null;
+                }
+              }
+              setEntityData(data);
+              if (data && 'title' in data && data.title) {
+                setSelectedNode((prev) => (prev ? { ...prev, label: (data as Trial).title?.slice(0, 50) ?? prev.label } : prev));
+              } else if (data && 'name' in data && data.name) {
+                setSelectedNode((prev) => (prev ? { ...prev, label: (data as Company | Asset).name ?? prev.label } : prev));
+              }
+            } catch (err) {
+              console.error('Failed to load entity for navigate:', err);
+            } finally {
+              setEntityLoading(false);
+            }
           }
         }}
       />

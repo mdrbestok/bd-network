@@ -57,6 +57,17 @@ class LandscapeResponse(BaseModel):
     standard_of_care: dict
 
 
+class AssetUpdateRequest(BaseModel):
+    modality: Optional[str] = None
+    targets: Optional[List[str]] = None
+    owner_company_id: Optional[str] = None
+    owner_company_name: Optional[str] = None  # If set, create/lookup company by name then set as owner
+
+
+class CompanyCreateRequest(BaseModel):
+    name: str
+
+
 # ==================== Endpoints ====================
 
 @router.get("/health", response_model=HealthResponse)
@@ -143,12 +154,14 @@ async def get_indication_graph(
     depth: int = Query(2, ge=1, le=10, description="Graph traversal depth"),
     phases: Optional[str] = Query(None, description="Comma-separated phase filters"),
     modalities: Optional[str] = Query(None, description="Comma-separated modality filters"),
-    include_trials: bool = Query(False, description="Include trial nodes in graph")
+    include_trials: bool = Query(False, description="Include trial nodes (legacy)"),
+    trial_filter: Optional[str] = Query("none", description="Which trials to show: none, recruiting, active_not_recruiting, all")
 ):
     """
     Get the network graph for an indication.
     
     Returns nodes and edges for visualization.
+    trial_filter: none (no trial nodes), recruiting, active_not_recruiting, all.
     """
     try:
         graph_service = get_graph_service()
@@ -162,7 +175,8 @@ async def get_indication_graph(
             depth=depth,
             phase_filter=phase_filter,
             modality_filter=modality_filter,
-            include_trials=include_trials
+            include_trials=include_trials,
+            trial_filter=trial_filter
         )
         
         return GraphResponse(
@@ -202,6 +216,7 @@ async def get_asset(asset_id: str):
     Get detailed information about an asset.
     
     Returns asset data with related trials, owners, and deals.
+    Includes user-confirmed overrides (modality, targets, ownership).
     """
     try:
         graph_service = get_graph_service()
@@ -215,6 +230,53 @@ async def get_asset(asset_id: str):
         raise
     except Exception as e:
         logger.error(f"Asset query failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.patch("/asset/{asset_id}")
+async def update_asset(asset_id: str, body: AssetUpdateRequest):
+    """
+    Update asset with user-confirmed data. ClinicalTrials.gov ingestion will not overwrite these.
+    
+    - modality: e.g. antibody, small_molecule, chemotherapy, bispecific
+    - targets: list of molecular targets
+    - owner_company_id: set/confirm owner by company_id
+    - owner_company_name: set/confirm owner by name (creates company if new)
+    """
+    try:
+        graph_service = get_graph_service()
+        # If owner by name, create or get company first
+        owner_company_id = body.owner_company_id
+        if body.owner_company_name and body.owner_company_name.strip():
+            owner_company_id = graph_service.create_company(body.owner_company_name.strip())
+        result = graph_service.update_asset(
+            asset_id,
+            modality=body.modality,
+            targets=body.targets,
+            owner_company_id=owner_company_id,
+        )
+        if not result:
+            raise HTTPException(status_code=404, detail="Asset not found or update not supported")
+        return result
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Asset update failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/company")
+async def create_company(body: CompanyCreateRequest):
+    """
+    Create a company (sponsor) by name. Use when assigning an asset to a new sponsor.
+    Returns company_id. Idempotent: same name returns same company_id.
+    """
+    try:
+        graph_service = get_graph_service()
+        company_id = graph_service.create_company(body.name)
+        return {"company_id": company_id, "name": body.name.strip()}
+    except Exception as e:
+        logger.error(f"Create company failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 

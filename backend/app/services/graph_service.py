@@ -64,9 +64,10 @@ class GraphService:
         depth: int = 2,
         phase_filter: Optional[List[str]] = None,
         modality_filter: Optional[List[str]] = None,
-        include_trials: bool = False
+        include_trials: bool = False,
+        trial_filter: Optional[str] = None
     ) -> Dict[str, Any]:
-        """Get the network graph for an indication."""
+        """Get the network graph for an indication. trial_filter: none, recruiting, active_not_recruiting, all."""
         # Map indication code to search terms for matching in conditions
         terms = settings.get_indication_terms(indication)
         
@@ -76,7 +77,8 @@ class GraphService:
             depth=depth,
             phase_filter=phase_filter,
             modality_filter=modality_filter,
-            include_trials=include_trials
+            include_trials=include_trials,
+            trial_filter=trial_filter
         )
     
     def get_company_details(self, company_id: str) -> Optional[Dict[str, Any]]:
@@ -84,9 +86,38 @@ class GraphService:
         return self.db.get_company(company_id)
     
     def get_asset_details(self, asset_id: str) -> Optional[Dict[str, Any]]:
-        """Get detailed asset information."""
+        """Get detailed asset information (includes user overrides)."""
         return self.db.get_asset(asset_id)
-    
+
+    def update_asset(
+        self,
+        asset_id: str,
+        modality: Optional[str] = None,
+        targets: Optional[List[str]] = None,
+        owner_company_id: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Set user overrides for an asset (modality, targets) and/or confirm ownership. Ingestion will not overwrite these."""
+        if not hasattr(self.db, 'set_asset_override'):
+            return None
+        if modality is not None or targets is not None:
+            self.db.set_asset_override(asset_id, modality=modality, targets=targets)
+        if owner_company_id is not None:
+            self.db.upsert_owns_user_confirmed(owner_company_id, asset_id, confidence=1.0)
+        return self.get_asset_details(asset_id)
+
+    def create_company(self, name: str) -> str:
+        """Create or get a company by name (e.g. for adding a new sponsor). Returns company_id."""
+        from ..models.nodes import Company, Evidence
+        company_id = Company.generate_id(name)
+        company = Company(
+            company_id=company_id,
+            name=name.strip(),
+            company_type="industry",
+            evidence=[Evidence(source_type="user_added", confidence=1.0)]
+        )
+        self.db.upsert_company(company)
+        return company_id
+
     def get_trial_details(self, trial_id: str) -> Optional[Dict[str, Any]]:
         """Get detailed trial information."""
         return self.db.get_trial(trial_id)

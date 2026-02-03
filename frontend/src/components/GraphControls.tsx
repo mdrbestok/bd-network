@@ -3,14 +3,15 @@
 import { useState } from 'react';
 import { Settings2, Filter, Layers } from 'lucide-react';
 import { cn } from '@/lib/utils';
+import type { TrialFilter } from '@/lib/api';
 
 interface GraphControlsProps {
-  includeTrials: boolean;
-  onIncludeTrialsChange: (include: boolean) => void;
+  trialFilter: TrialFilter;
+  onTrialFilterChange: (filter: TrialFilter) => void;
   showTrialSponsors: boolean;
   onShowTrialSponsorsChange: (show: boolean) => void;
-  industryOnly: boolean;
-  onIndustryOnlyChange: (industryOnly: boolean) => void;
+  includeSites: boolean;
+  onIncludeSitesChange: (include: boolean) => void;
   pinOnDrag: boolean;
   onPinOnDragChange: (pin: boolean) => void;
   phases: string[];
@@ -21,13 +22,20 @@ interface GraphControlsProps {
   onModalitiesChange: (modalities: string[]) => void;
 }
 
+const TRIAL_FILTER_OPTIONS: { value: TrialFilter; label: string }[] = [
+  { value: 'none', label: 'No trials' },
+  { value: 'recruiting', label: 'Recruiting trials' },
+  { value: 'active_not_recruiting', label: 'Active, not recruiting' },
+  { value: 'all', label: 'All trials' },
+];
+
 export default function GraphControls({
-  includeTrials,
-  onIncludeTrialsChange,
+  trialFilter,
+  onTrialFilterChange,
   showTrialSponsors,
   onShowTrialSponsorsChange,
-  industryOnly,
-  onIndustryOnlyChange,
+  includeSites,
+  onIncludeSitesChange,
   pinOnDrag,
   onPinOnDragChange,
   phases,
@@ -57,48 +65,45 @@ export default function GraphControls({
 
       {/* Basic controls */}
       <div className="space-y-3">
-        {/* Industry Only toggle */}
+        {/* Include Sites toggle: ON = show sites/academic, OFF = industry only */}
         <div className="flex items-center justify-between">
-          <label className="text-xs text-gray-600" title="Hide academic sites, investigators, and other non-industry sponsors">
-            Industry Sponsors Only
+          <label className="text-xs text-gray-600" title="Turn on to show sites, academic, and non-industry sponsors">
+            Include Sites
           </label>
           <button
-            onClick={() => onIndustryOnlyChange(!industryOnly)}
+            onClick={() => onIncludeSitesChange(!includeSites)}
             className={cn(
               'relative w-10 h-5 rounded-full transition-colors',
-              industryOnly ? 'bg-blue-500' : 'bg-gray-300'
+              includeSites ? 'bg-blue-500' : 'bg-gray-300'
             )}
           >
             <div
               className={cn(
                 'absolute top-0.5 w-4 h-4 bg-white rounded-full transition-transform shadow',
-                industryOnly ? 'translate-x-5' : 'translate-x-0.5'
+                includeSites ? 'translate-x-5' : 'translate-x-0.5'
               )}
             />
           </button>
         </div>
 
-        {/* Include trials toggle */}
-        <div className="flex items-center justify-between">
-          <label className="text-xs text-gray-600">Show Trials</label>
-          <button
-            onClick={() => onIncludeTrialsChange(!includeTrials)}
-            className={cn(
-              'relative w-10 h-5 rounded-full transition-colors',
-              includeTrials ? 'bg-blue-500' : 'bg-gray-300'
-            )}
+        {/* Show trials dropdown */}
+        <div>
+          <label className="block text-xs text-gray-600 mb-1">Show Trials</label>
+          <select
+            value={trialFilter}
+            onChange={(e) => onTrialFilterChange(e.target.value as TrialFilter)}
+            className="w-full text-sm border border-gray-300 rounded-lg px-3 py-2 bg-white"
           >
-            <div
-              className={cn(
-                'absolute top-0.5 w-4 h-4 bg-white rounded-full transition-transform shadow',
-                includeTrials ? 'translate-x-5' : 'translate-x-0.5'
-              )}
-            />
-          </button>
+            {TRIAL_FILTER_OPTIONS.map((opt) => (
+              <option key={opt.value} value={opt.value}>
+                {opt.label}
+              </option>
+            ))}
+          </select>
         </div>
 
         {/* Show trial-sponsor edges toggle (only when trials are shown) */}
-        {includeTrials && (
+        {trialFilter !== 'none' && (
           <div className="flex items-center justify-between pl-3 border-l-2 border-gray-200">
             <label className="text-xs text-gray-600" title="Show dotted lines from trials to their sponsors">
               Trial → Sponsor Links

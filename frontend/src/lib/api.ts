@@ -58,6 +58,8 @@ export async function search(query: string, limit: number = 20): Promise<SearchR
 }
 
 // Graph
+export type TrialFilter = 'none' | 'recruiting' | 'active_not_recruiting' | 'all';
+
 export async function getIndicationGraph(
   indication: string,
   options: {
@@ -65,12 +67,14 @@ export async function getIndicationGraph(
     phases?: string[];
     modalities?: string[];
     includeTrials?: boolean;
+    trialFilter?: TrialFilter;
   } = {}
 ): Promise<GraphData> {
   const params = new URLSearchParams({
     name: indication,
     depth: String(options.depth || 2),
     include_trials: String(options.includeTrials || false),
+    trial_filter: options.trialFilter ?? 'none',
   });
 
   if (options.phases?.length) {
@@ -103,6 +107,30 @@ export async function getCompany(companyId: string): Promise<Company> {
 // Asset details
 export async function getAsset(assetId: string): Promise<Asset> {
   return fetchApi<Asset>(`/asset/${encodeURIComponent(assetId)}`);
+}
+
+// Update asset (user-confirmed modality, targets, owner; ingestion will not overwrite)
+export async function updateAsset(
+  assetId: string,
+  payload: {
+    modality?: string;
+    targets?: string[];
+    owner_company_id?: string;
+    owner_company_name?: string;
+  }
+): Promise<Asset> {
+  return fetchApi<Asset>(`/asset/${encodeURIComponent(assetId)}`, {
+    method: 'PATCH',
+    body: JSON.stringify(payload),
+  });
+}
+
+// Create company by name (e.g. new sponsor). Returns company_id.
+export async function createCompany(name: string): Promise<{ company_id: string; name: string }> {
+  return fetchApi<{ company_id: string; name: string }>('/company', {
+    method: 'POST',
+    body: JSON.stringify({ name }),
+  });
 }
 
 // Trial details

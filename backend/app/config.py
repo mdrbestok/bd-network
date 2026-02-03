@@ -33,6 +33,7 @@ class Settings(BaseSettings):
             "mucosal malignant melanoma",
             "melanoma of mucosa",
             "uveal melanoma",
+            "melanoma, uveal",  # ClinicalTrials.gov variant (e.g. NCT05315258)
             "metastatic uveal melanoma",
             "ocular melanoma"
         ],

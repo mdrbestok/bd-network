@@ -4,6 +4,7 @@ Alternative to Neo4j for running without Docker.
 """
 import json
 import logging
+import re
 import sqlite3
 from pathlib import Path
 from typing import List, Dict, Any, Optional
@@ -11,7 +12,7 @@ from contextlib import contextmanager
 from datetime import datetime, date
 
 from ..models.nodes import Company, Asset, Deal, Document, Trial
-from ..models.edges import PartyTo, Covers, SupportedBy, Owns, HasTrial, SponsorsTrial
+from ..models.edges import PartyTo, Covers, SupportedBy, Owns, HasTrial, SponsorsTrial, EdgeEvidence
 
 logger = logging.getLogger(__name__)
 
@@ -24,6 +25,15 @@ def json_serial(obj):
 
 # Database file location
 DB_PATH = Path(__file__).parent.parent.parent / "data" / "bdnetwork.db"
+
+
+def _conditions_to_searchable(conditions: List[str]) -> str:
+    """Normalize condition strings into one searchable string so variant phrasings match (e.g. 'Melanoma, Uveal' matches 'uveal melanoma')."""
+    if not conditions:
+        return ""
+    combined = " ".join(c for c in conditions if isinstance(c, str))
+    normalized = re.sub(r"[^\w\s]", " ", combined).lower()
+    return " ".join(normalized.split())
 
 
 class SQLiteService:
@@ -111,7 +121,21 @@ class SQLiteService:
                     updated_at TEXT
                 )
             """)
-            
+            # Searchable conditions: normalized text so "Melanoma, Uveal" matches term "uveal melanoma"
+            try:
+                cursor.execute("ALTER TABLE trials ADD COLUMN conditions_searchable TEXT")
+            except sqlite3.OperationalError:
+                pass
+            # Backfill conditions_searchable from conditions for existing rows
+            cursor.execute("SELECT trial_id, conditions FROM trials WHERE conditions_searchable IS NULL AND conditions IS NOT NULL")
+            for row in cursor.fetchall():
+                try:
+                    cond_list = json.loads(row["conditions"]) if isinstance(row["conditions"], str) else row["conditions"]
+                    searchable = _conditions_to_searchable(cond_list)
+                    cursor.execute("UPDATE trials SET conditions_searchable = ? WHERE trial_id = ?", (searchable, row["trial_id"]))
+                except (json.JSONDecodeError, TypeError):
+                    pass
+
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS documents (
                     doc_id TEXT PRIMARY KEY,
@@ -168,7 +192,21 @@ class SQLiteService:
                     source TEXT,
                     is_current INTEGER,
                     evidence TEXT,
+                    user_confirmed INTEGER DEFAULT 0,
                     PRIMARY KEY (company_id, asset_id)
+                )
+            """)
+            try:
+                cursor.execute("ALTER TABLE owns ADD COLUMN user_confirmed INTEGER DEFAULT 0")
+            except sqlite3.OperationalError:
+                pass
+
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS asset_user_overrides (
+                    asset_id TEXT PRIMARY KEY,
+                    modality TEXT,
+                    targets TEXT,
+                    updated_at TEXT
                 )
             """)
             
@@ -226,9 +264,21 @@ class SQLiteService:
             return company.company_id
     
     def upsert_asset(self, asset: Asset) -> str:
-        """Insert or update an Asset."""
+        """Insert or update an Asset. User overrides (modality/targets) are preserved and not overwritten by ingestion."""
         with self.connection() as conn:
             cursor = conn.cursor()
+            cursor.execute("SELECT modality, targets FROM asset_user_overrides WHERE asset_id = ?", (asset.asset_id,))
+            override = cursor.fetchone()
+            modality = asset.modality
+            targets = asset.targets
+            if override:
+                if override["modality"] is not None:
+                    modality = override["modality"]
+                if override["targets"]:
+                    try:
+                        targets = json.loads(override["targets"])
+                    except (json.JSONDecodeError, TypeError):
+                        pass
             cursor.execute("""
                 INSERT OR REPLACE INTO assets
                 (asset_id, name, synonyms, modality, targets, indications, stage_current, 
@@ -238,8 +288,8 @@ class SQLiteService:
                 asset.asset_id,
                 asset.name,
                 json.dumps(asset.synonyms),
-                asset.modality,
-                json.dumps(asset.targets),
+                modality,
+                json.dumps(targets),
                 json.dumps(asset.indications),
                 asset.stage_current,
                 asset.modality_confidence,
@@ -251,14 +301,16 @@ class SQLiteService:
     
     def upsert_trial(self, trial: Trial) -> str:
         """Insert or update a Trial."""
+        conditions_json = json.dumps(trial.conditions)
+        conditions_searchable = _conditions_to_searchable(trial.conditions or [])
         with self.connection() as conn:
             cursor = conn.cursor()
             cursor.execute("""
                 INSERT OR REPLACE INTO trials
                 (trial_id, title, phase, status, start_date, completion_date, interventions,
-                 conditions, sponsors, collaborators, enrollment, study_type, brief_summary,
+                 conditions, conditions_searchable, sponsors, collaborators, enrollment, study_type, brief_summary,
                  source_url, evidence, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 trial.trial_id,
                 trial.title,
@@ -267,7 +319,8 @@ class SQLiteService:
                 str(trial.start_date) if trial.start_date else None,
                 str(trial.completion_date) if trial.completion_date else None,
                 json.dumps(trial.interventions),
-                json.dumps(trial.conditions),
+                conditions_json,
+                conditions_searchable,
                 json.dumps(trial.sponsors),
                 json.dumps(trial.collaborators),
                 trial.enrollment,
@@ -348,22 +401,77 @@ class SQLiteService:
                 json.dumps([e.model_dump() for e in rel.evidence], default=json_serial)
             ))
     
-    def create_owns(self, rel: Owns):
-        """Create OWNS relationship."""
+    def create_owns(self, rel: Owns, user_confirmed: bool = False):
+        """Create or update OWNS relationship. If user_confirmed=True, preserves existing user_confirmed=1."""
         with self.connection() as conn:
             cursor = conn.cursor()
+            if user_confirmed:
+                cursor.execute("""
+                    INSERT INTO owns 
+                    (company_id, asset_id, from_date, to_date, confidence, source, is_current, evidence, user_confirmed)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1)
+                    ON CONFLICT(company_id, asset_id) DO UPDATE SET
+                    confidence = excluded.confidence,
+                    source = excluded.source,
+                    user_confirmed = 1,
+                    evidence = excluded.evidence
+                """, (
+                    rel.company_id,
+                    rel.asset_id,
+                    str(rel.from_date) if rel.from_date else None,
+                    str(rel.to_date) if rel.to_date else None,
+                    rel.confidence,
+                    rel.source,
+                    1 if rel.is_current else 0,
+                    json.dumps([e.model_dump() for e in rel.evidence], default=json_serial)
+                ))
+            else:
+                # Do not overwrite if existing row has user_confirmed=1
+                cursor.execute("SELECT user_confirmed FROM owns WHERE company_id = ? AND asset_id = ?",
+                               (rel.company_id, rel.asset_id))
+                row = cursor.fetchone()
+                if row and row[0]:
+                    return  # Skip overwriting user-confirmed ownership
+                cursor.execute("""
+                    INSERT OR REPLACE INTO owns 
+                    (company_id, asset_id, from_date, to_date, confidence, source, is_current, evidence, user_confirmed)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0)
+                """, (
+                    rel.company_id,
+                    rel.asset_id,
+                    str(rel.from_date) if rel.from_date else None,
+                    str(rel.to_date) if rel.to_date else None,
+                    rel.confidence,
+                    rel.source,
+                    1 if rel.is_current else 0,
+                    json.dumps([e.model_dump() for e in rel.evidence], default=json_serial)
+                ))
+
+    def upsert_owns_user_confirmed(self, company_id: str, asset_id: str, confidence: float = 1.0) -> None:
+        """Set or confirm ownership of an asset by a company. ClinicalTrials.gov ingestion will not overwrite this."""
+        with self.connection() as conn:
+            cursor = conn.cursor()
+            rel = Owns(
+                company_id=company_id,
+                asset_id=asset_id,
+                confidence=confidence,
+                source="user_confirmed",
+                is_current=True,
+                evidence=[EdgeEvidence(source_type="user_confirmed", confidence=confidence)]
+            )
             cursor.execute("""
-                INSERT OR REPLACE INTO owns 
-                (company_id, asset_id, from_date, to_date, confidence, source, is_current, evidence)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO owns (company_id, asset_id, from_date, to_date, confidence, source, is_current, evidence, user_confirmed)
+                VALUES (?, ?, ?, ?, ?, ?, 1, ?, 1)
+                ON CONFLICT(company_id, asset_id) DO UPDATE SET confidence = ?, source = 'user_confirmed', user_confirmed = 1, evidence = ?
             """, (
                 rel.company_id,
                 rel.asset_id,
-                str(rel.from_date) if rel.from_date else None,
-                str(rel.to_date) if rel.to_date else None,
+                None,
+                None,
                 rel.confidence,
                 rel.source,
-                1 if rel.is_current else 0,
+                json.dumps([e.model_dump() for e in rel.evidence], default=json_serial),
+                rel.confidence,
                 json.dumps([e.model_dump() for e in rel.evidence], default=json_serial)
             ))
     
@@ -451,8 +559,40 @@ class SQLiteService:
             
             return company
     
+    def get_asset_overrides(self, asset_id: str) -> Optional[Dict[str, Any]]:
+        """Get user override for an asset (modality, targets). Returns None if no override."""
+        with self.connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT modality, targets FROM asset_user_overrides WHERE asset_id = ?",
+                (asset_id,)
+            )
+            row = cursor.fetchone()
+            if not row:
+                return None
+            return {
+                "modality": row["modality"],
+                "targets": json.loads(row["targets"]) if row["targets"] else []
+            }
+
+    def set_asset_override(self, asset_id: str, modality: Optional[str] = None, targets: Optional[List[str]] = None) -> None:
+        """Set user override for asset modality/targets. ClinicalTrials.gov ingestion will not overwrite these."""
+        with self.connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT modality, targets FROM asset_user_overrides WHERE asset_id = ?", (asset_id,))
+            r = cursor.fetchone()
+            cur_mod = r["modality"] if r else None
+            cur_tgt = json.loads(r["targets"]) if r and r["targets"] else []
+            final_mod = modality if modality is not None else cur_mod
+            final_tgt = targets if targets is not None else cur_tgt
+            cursor.execute("""
+                INSERT INTO asset_user_overrides (asset_id, modality, targets, updated_at)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(asset_id) DO UPDATE SET modality = ?, targets = ?, updated_at = ?
+            """, (asset_id, final_mod, json.dumps(final_tgt), datetime.utcnow().isoformat(), final_mod, json.dumps(final_tgt), datetime.utcnow().isoformat()))
+
     def get_asset(self, asset_id: str) -> Optional[Dict[str, Any]]:
-        """Get an asset by ID with related data."""
+        """Get an asset by ID with related data. Merges user overrides for modality/targets."""
         with self.connection() as conn:
             cursor = conn.cursor()
             
@@ -464,6 +604,20 @@ class SQLiteService:
             
             asset = self._row_to_dict(asset_row)
             
+            # Apply user overrides
+            cursor.execute("SELECT modality, targets FROM asset_user_overrides WHERE asset_id = ?", (asset_id,))
+            override_row = cursor.fetchone()
+            if override_row:
+                if override_row["modality"] is not None:
+                    asset["modality"] = override_row["modality"]
+                    asset["modality_user_confirmed"] = True
+                if override_row["targets"]:
+                    try:
+                        asset["targets"] = json.loads(override_row["targets"])
+                        asset["targets_user_confirmed"] = True
+                    except (json.JSONDecodeError, TypeError):
+                        pass
+            
             # Get trials
             cursor.execute("""
                 SELECT t.*
@@ -473,9 +627,9 @@ class SQLiteService:
             """, (asset_id,))
             asset['trials'] = [self._row_to_dict(row) for row in cursor.fetchall()]
             
-            # Get owners
+            # Get owners (include user_confirmed)
             cursor.execute("""
-                SELECT c.*, o.confidence, o.source as ownership_source
+                SELECT c.*, o.confidence, o.source as ownership_source, o.user_confirmed
                 FROM companies c
                 JOIN owns o ON c.company_id = o.company_id
                 WHERE o.asset_id = ?
@@ -485,7 +639,8 @@ class SQLiteService:
                 owner = self._row_to_dict(row)
                 owner['ownership'] = {
                     'confidence': row['confidence'],
-                    'source': row['ownership_source']
+                    'source': row['ownership_source'],
+                    'user_confirmed': bool(row['user_confirmed']) if 'user_confirmed' in row.keys() and row['user_confirmed'] else False
                 }
                 asset['owners'].append(owner)
             
@@ -557,6 +712,21 @@ class SQLiteService:
         
         return results
     
+    def _trial_matches_status_filter(self, trial: Dict[str, Any], trial_filter: str) -> bool:
+        """Return True if trial should be included for the given trial_filter."""
+        if trial_filter == "none":
+            return False
+        if trial_filter == "all":
+            return True
+        # Normalize status: "Active, not recruiting" or "ACTIVE_NOT_RECRUITING" -> ACTIVE_NOT_RECRUITING
+        raw = (trial.get("status") or "").strip()
+        status = raw.upper().replace(",", "").replace(" ", "_").replace("-", "_")
+        if trial_filter == "recruiting":
+            return status in ("RECRUITING", "NOT_YET_RECRUITING")
+        if trial_filter == "active_not_recruiting":
+            return status == "ACTIVE_NOT_RECRUITING"
+        return True
+
     def get_indication_graph(
         self,
         indication_terms: List[str],
@@ -564,27 +734,41 @@ class SQLiteService:
         phase_filter: Optional[List[str]] = None,
         modality_filter: Optional[List[str]] = None,
         include_trials: bool = False,
+        trial_filter: Optional[str] = None,
         limit: int = 500
     ) -> Dict[str, Any]:
-        """Get the network graph for an indication."""
+        """Get the network graph for an indication. trial_filter: none, recruiting, active_not_recruiting, all."""
         nodes = []
         edges = []
         seen_nodes = set()
         seen_edges = set()
-        
+        # Support legacy include_trials; trial_filter overrides
+        if trial_filter is not None:
+            show_trials = trial_filter != "none"
+        else:
+            show_trials = include_trials
+
         with self.connection() as conn:
             cursor = conn.cursor()
-            
-            # Build query to match ANY of the indication terms
-            term_conditions = " OR ".join(["LOWER(conditions) LIKE ?" for _ in indication_terms])
-            term_params = [f"%{term.lower()}%" for term in indication_terms]
-            
+            # Match if any indication term matches: for each term, all words in the term must appear in conditions_searchable
+            # (so "Melanoma, Uveal" matches term "uveal melanoma" without adding config for every variant)
+            searchable_col = "LOWER(COALESCE(conditions_searchable, ''))"
+            term_clauses = []
+            term_params: List[str] = []
+            for term in indication_terms:
+                words = [w for w in term.lower().split() if w]
+                if not words:
+                    continue
+                term_clauses.append(" AND ".join([f"{searchable_col} LIKE ?" for _ in words]))
+                term_params.extend([f"%{w}%" for w in words])
+            where_sql = " OR ".join([f"({c})" for c in term_clauses]) if term_clauses else "1=0"
+            term_params.append(limit)
             # Find trials matching any indication term
             cursor.execute(f"""
-                SELECT * FROM trials 
-                WHERE {term_conditions}
+                SELECT * FROM trials
+                WHERE {where_sql}
                 LIMIT ?
-            """, (*term_params, limit))
+            """, term_params)
             
             trial_rows = cursor.fetchall()
             
@@ -596,8 +780,11 @@ class SQLiteService:
                 if phase_filter and trial.get('phase') not in phase_filter:
                     continue
                 
-                # Add trial node if including trials
-                if include_trials and trial_id not in seen_nodes:
+                # Include this trial node/edges only if it matches the status filter
+                trial_in_scope = show_trials and (not trial_filter or trial_filter == "all" or self._trial_matches_status_filter(trial, trial_filter))
+                
+                # Add trial node if including trials and trial matches filter
+                if trial_in_scope and trial_id not in seen_nodes:
                     seen_nodes.add(trial_id)
                     nodes.append({
                         "id": trial_id,
@@ -627,7 +814,7 @@ class SQLiteService:
                             "data": company
                         })
                     
-                    if include_trials:
+                    if trial_in_scope:
                         edge_id = f"{company_id}-sponsors-{trial_id}"
                         if edge_id not in seen_edges:
                             seen_edges.add(edge_id)
@@ -640,13 +827,17 @@ class SQLiteService:
                                 "data": {"role": company_row['role']}
                             })
                 
-                # Get all companies sponsoring this trial (for creating edges to assets)
-                trial_sponsor_ids = []
+                # Lead sponsors that are industry only (for DEVELOPS → asset). Sites/academic stay connected only to trials.
+                lead_sponsor_ids = []
                 cursor.execute("""
-                    SELECT company_id FROM sponsors_trial WHERE trial_id = ?
+                    SELECT st.company_id
+                    FROM sponsors_trial st
+                    JOIN companies c ON c.company_id = st.company_id
+                    WHERE st.trial_id = ? AND st.role = 'lead_sponsor'
+                    AND COALESCE(c.company_type, 'industry') = 'industry'
                 """, (trial_id,))
                 for row in cursor.fetchall():
-                    trial_sponsor_ids.append(row['company_id'])
+                    lead_sponsor_ids.append(row['company_id'])
                 
                 # Get assets linked to this trial
                 cursor.execute("""
@@ -673,7 +864,7 @@ class SQLiteService:
                             "data": asset
                         })
                     
-                    if include_trials:
+                    if trial_in_scope:
                         edge_id = f"{asset_id}-has_trial-{trial_id}"
                         if edge_id not in seen_edges:
                             seen_edges.add(edge_id)
@@ -686,9 +877,18 @@ class SQLiteService:
                                 "data": {}
                             })
                     
-                    # Create edges from all sponsors of this trial to this asset
-                    # This ensures all assets used in trials appear connected to their sponsors
-                    for sponsor_id in trial_sponsor_ids:
+                    # Get explicit owners for this asset so we don't add DEVELOPS for them (OWNS takes precedence)
+                    owner_ids_for_asset = set()
+                    cursor.execute("""
+                        SELECT company_id FROM owns WHERE asset_id = ?
+                    """, (asset_id,))
+                    for row in cursor.fetchall():
+                        owner_ids_for_asset.add(row['company_id'])
+                    
+                    # Create DEVELOPS only from industry lead sponsor to asset; skip if company already OWNS (use OWNS in graph)
+                    for sponsor_id in lead_sponsor_ids:
+                        if sponsor_id in owner_ids_for_asset:
+                            continue
                         edge_id = f"{sponsor_id}-develops-{asset_id}"
                         if edge_id not in seen_edges:
                             seen_edges.add(edge_id)
@@ -754,33 +954,43 @@ class SQLiteService:
             "total_companies": 0
         }
         
-        # Build condition for matching any term
-        term_conditions = " OR ".join(["LOWER(conditions) LIKE ?" for _ in indication_terms])
-        term_params = [f"%{term.lower()}%" for term in indication_terms]
-        
+        # Same "all words in term" matching as get_indication_graph (conditions_searchable)
+        searchable_col = "LOWER(COALESCE(conditions_searchable, ''))"
+        searchable_col_t = "LOWER(COALESCE(t.conditions_searchable, ''))"
+        term_clauses = []
+        term_clauses_t = []
+        term_params: List[str] = []
+        for term in indication_terms:
+            words = [w for w in term.lower().split() if w]
+            if not words:
+                continue
+            term_clauses.append(" AND ".join([f"{searchable_col} LIKE ?" for _ in words]))
+            term_clauses_t.append(" AND ".join([f"{searchable_col_t} LIKE ?" for _ in words]))
+            term_params.extend([f"%{w}%" for w in words])
+        where_sql = " OR ".join([f"({c})" for c in term_clauses]) if term_clauses else "1=0"
+        where_sql_t = " OR ".join([f"({c})" for c in term_clauses_t]) if term_clauses_t else "1=0"
+
         with self.connection() as conn:
             cursor = conn.cursor()
-            
             # Trials by phase
             cursor.execute(f"""
-                SELECT phase, COUNT(*) as count 
-                FROM trials 
-                WHERE {term_conditions}
+                SELECT phase, COUNT(*) as count
+                FROM trials
+                WHERE {where_sql}
                 GROUP BY phase
                 ORDER BY count DESC
             """, term_params)
             stats["assets_by_phase"] = [
-                {"phase": row['phase'], "count": row['count']} 
+                {"phase": row['phase'], "count": row['count']}
                 for row in cursor.fetchall() if row['phase']
             ]
-            
             # Sponsors by trial count
             cursor.execute(f"""
                 SELECT c.name as sponsor, c.company_id as id, COUNT(st.trial_id) as trial_count
                 FROM companies c
                 JOIN sponsors_trial st ON c.company_id = st.company_id
                 JOIN trials t ON st.trial_id = t.trial_id
-                WHERE {term_conditions.replace('conditions', 't.conditions')}
+                WHERE {where_sql_t}
                 GROUP BY c.company_id
                 ORDER BY trial_count DESC
                 LIMIT 20
@@ -789,14 +999,13 @@ class SQLiteService:
                 {"sponsor": row['sponsor'], "id": row['id'], "trial_count": row['trial_count']}
                 for row in cursor.fetchall()
             ]
-            
             # Modalities
             cursor.execute(f"""
                 SELECT a.modality, COUNT(DISTINCT a.asset_id) as count
                 FROM assets a
                 JOIN has_trial ht ON a.asset_id = ht.asset_id
                 JOIN trials t ON ht.trial_id = t.trial_id
-                WHERE ({term_conditions.replace('conditions', 't.conditions')}) AND a.modality IS NOT NULL
+                WHERE ({where_sql_t}) AND a.modality IS NOT NULL
                 GROUP BY a.modality
                 ORDER BY count DESC
             """, term_params)
@@ -804,30 +1013,27 @@ class SQLiteService:
                 {"modality": row['modality'], "count": row['count']}
                 for row in cursor.fetchall()
             ]
-            
             # Totals
             cursor.execute(f"""
                 SELECT COUNT(DISTINCT t.trial_id) as trials
                 FROM trials t
-                WHERE {term_conditions.replace('conditions', 't.conditions')}
+                WHERE {where_sql_t}
             """, term_params)
             stats["total_trials"] = cursor.fetchone()['trials']
-            
             cursor.execute(f"""
                 SELECT COUNT(DISTINCT a.asset_id) as assets
                 FROM assets a
                 JOIN has_trial ht ON a.asset_id = ht.asset_id
                 JOIN trials t ON ht.trial_id = t.trial_id
-                WHERE {term_conditions.replace('conditions', 't.conditions')}
+                WHERE {where_sql_t}
             """, term_params)
             stats["total_assets"] = cursor.fetchone()['assets']
-            
             cursor.execute(f"""
                 SELECT COUNT(DISTINCT c.company_id) as companies
                 FROM companies c
                 JOIN sponsors_trial st ON c.company_id = st.company_id
                 JOIN trials t ON st.trial_id = t.trial_id
-                WHERE {term_conditions.replace('conditions', 't.conditions')}
+                WHERE {where_sql_t}
             """, term_params)
             stats["total_companies"] = cursor.fetchone()['companies']
         

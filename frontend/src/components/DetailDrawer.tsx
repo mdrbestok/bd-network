@@ -1,17 +1,19 @@
 'use client';
 
-import { X, ExternalLink, AlertCircle, Building2, FlaskConical, FileText } from 'lucide-react';
+import { useState, useCallback, useEffect } from 'react';
+import { X, ExternalLink, AlertCircle, Building2, Check, Plus } from 'lucide-react';
 import type { GraphNode, GraphEdge, Company, Asset, Trial } from '@/types';
 import {
   cn,
   nodeColorsBg,
-  nodeColorsBgLight,
   nodeColorsText,
   formatPhase,
   formatStatus,
   getStatusColor,
   formatConfidence,
+  sortTrialsActiveFirst,
 } from '@/lib/utils';
+import { updateAsset, search } from '@/lib/api';
 
 interface DetailDrawerProps {
   isOpen: boolean;
@@ -21,6 +23,7 @@ interface DetailDrawerProps {
   entityData?: Company | Asset | Trial | null;
   loading?: boolean;
   onNavigateToNode?: (nodeId: string, nodeType: string) => void;
+  onRefreshEntity?: () => void;
 }
 
 export default function DetailDrawer({
@@ -31,6 +34,7 @@ export default function DetailDrawer({
   entityData,
   loading,
   onNavigateToNode,
+  onRefreshEntity,
 }: DetailDrawerProps) {
   if (!isOpen) return null;
 
@@ -79,7 +83,7 @@ export default function DetailDrawer({
             <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-blue-500" />
           </div>
         ) : node ? (
-          <NodeDetail node={node} entityData={entityData} onNavigateToNode={onNavigateToNode} />
+          <NodeDetail node={node} entityData={entityData} onNavigateToNode={onNavigateToNode} onRefreshEntity={onRefreshEntity} />
         ) : edge ? (
           <EdgeDetail edge={edge} />
         ) : (
@@ -94,10 +98,12 @@ function NodeDetail({
   node,
   entityData,
   onNavigateToNode,
+  onRefreshEntity,
 }: {
   node: GraphNode;
   entityData?: Company | Asset | Trial | null;
   onNavigateToNode?: (nodeId: string, nodeType: string) => void;
+  onRefreshEntity?: () => void;
 }) {
   const data = entityData || node.data;
 
@@ -113,39 +119,24 @@ function NodeDetail({
 
       {/* Type-specific content */}
       {node.type === 'company' && <CompanyDetails data={data as any} onNavigateToNode={onNavigateToNode} />}
-      {node.type === 'asset' && <AssetDetails data={data as any} onNavigateToNode={onNavigateToNode} />}
+      {node.type === 'asset' && <AssetDetails assetId={node.id} data={data as any} onNavigateToNode={onNavigateToNode} onRefreshEntity={onRefreshEntity} />}
       {node.type === 'trial' && <TrialDetails data={data as any} onNavigateToNode={onNavigateToNode} />}
       {node.type === 'deal' && <DealDetails data={data as any} />}
 
-      {/* Evidence section */}
-      {(data as any)?.evidence && (data as any).evidence.length > 0 && (
-        <div className="pt-4 border-t border-gray-200">
-          <h3 className="text-sm font-medium text-gray-700 mb-2">Evidence</h3>
-          <div className="space-y-2">
-            {(data as any).evidence.slice(0, 3).map((ev: any, i: number) => (
-              <div
-                key={i}
-                className="text-xs bg-gray-50 rounded p-2 flex items-start space-x-2"
-              >
-                <FileText className="w-4 h-4 text-gray-400 flex-shrink-0 mt-0.5" />
-                <div>
-                  <p className="text-gray-600">{ev.source_type}</p>
-                  {ev.source_url && (
-                    <a
-                      href={ev.source_url}
-                      target="_blank"
-                      rel="noopener noreferrer"
-                      className="text-blue-500 hover:underline flex items-center"
-                    >
-                      View source
-                      <ExternalLink className="w-3 h-3 ml-1" />
-                    </a>
-                  )}
-                </div>
-              </div>
-            ))}
-          </div>
-        </div>
+      {/* Evidence - compact one-liner */}
+      {(data as any)?.evidence?.[0]?.source_url && (
+        <p className="text-xs text-gray-500 pt-2 border-t border-gray-100">
+          Source:{' '}
+          <a
+            href={(data as any).evidence[0].source_url}
+            target="_blank"
+            rel="noopener noreferrer"
+            className="text-blue-500 hover:underline inline-flex items-center"
+          >
+            {(data as any).evidence[0].source_type || 'View'}
+            <ExternalLink className="w-3 h-3 ml-0.5" />
+          </a>
+        </p>
       )}
     </div>
   );
@@ -224,8 +215,8 @@ function CompanyDetails({ data, onNavigateToNode }: { data: any; onNavigateToNod
           <p className="text-xs text-gray-500 uppercase font-medium mb-2">
             Trials ({data.trials.length}) <span className="text-blue-500 font-normal">— click to focus</span>
           </p>
-          <div className="space-y-2 max-h-48 overflow-y-auto">
-            {data.trials.slice(0, 5).map((trial: any) => (
+          <div className="space-y-2 max-h-80 overflow-y-auto">
+            {sortTrialsActiveFirst(data.trials).slice(0, 20).map((trial: any) => (
               <button
                 key={trial.trial_id}
                 onClick={() => onNavigateToNode?.(trial.trial_id, 'trial')}
@@ -277,7 +268,84 @@ function CompanyDetails({ data, onNavigateToNode }: { data: any; onNavigateToNod
   );
 }
 
-function AssetDetails({ data, onNavigateToNode }: { data: any; onNavigateToNode?: (nodeId: string, nodeType: string) => void }) {
+const MODALITY_OPTIONS = [
+  'antibody',
+  'small_molecule',
+  'chemotherapy',
+  'bispecific',
+  'cell_therapy',
+  'vaccine',
+  'adc',
+  'gene_therapy',
+  'oncolytic_virus',
+  'checkpoint_inhibitor',
+  'peptide',
+  'protein',
+  'radiation',
+  'other',
+];
+
+function AssetDetails({
+  assetId,
+  data,
+  onNavigateToNode,
+  onRefreshEntity,
+}: {
+  assetId: string;
+  data: any;
+  onNavigateToNode?: (nodeId: string, nodeType: string) => void;
+  onRefreshEntity?: () => void;
+}) {
+  const [editing, setEditing] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const [editModality, setEditModality] = useState(data?.modality ?? '');
+  const [editTargets, setEditTargets] = useState<string[]>(data?.targets ?? []);
+  const [newTarget, setNewTarget] = useState('');
+  const [ownerSearch, setOwnerSearch] = useState('');
+  const [ownerSearchResults, setOwnerSearchResults] = useState<{ company_id: string; name: string }[]>([]);
+  const [selectedOwnerId, setSelectedOwnerId] = useState<string | null>(null);
+  const [newOwnerName, setNewOwnerName] = useState('');
+  const [saveError, setSaveError] = useState<string | null>(null);
+
+  useEffect(() => {
+    setEditModality(data?.modality ?? '');
+    setEditTargets(data?.targets ?? []);
+  }, [data?.modality, data?.targets]);
+
+  const runOwnerSearch = useCallback(async (q: string) => {
+    if (q.length < 2) {
+      setOwnerSearchResults([]);
+      return;
+    }
+    try {
+      const res = await search(q, 10);
+      const companies = (res.companies ?? []).map((c: any) => ({ company_id: c.company_id, name: c.name }));
+      setOwnerSearchResults(companies);
+    } catch {
+      setOwnerSearchResults([]);
+    }
+  }, []);
+
+  const handleSave = async () => {
+    setSaveError(null);
+    setSaving(true);
+    try {
+      const payload: { modality?: string; targets?: string[]; owner_company_id?: string; owner_company_name?: string } = {};
+      if (editModality.trim()) payload.modality = editModality.trim();
+      if (editTargets.length) payload.targets = editTargets;
+      if (selectedOwnerId) payload.owner_company_id = selectedOwnerId;
+      if (newOwnerName.trim()) payload.owner_company_name = newOwnerName.trim();
+      await updateAsset(assetId, payload);
+      if (onRefreshEntity) await onRefreshEntity();
+      setEditing(false);
+    } catch (e) {
+      const message = e instanceof Error ? e.message : 'Save failed';
+      setSaveError(message);
+    } finally {
+      setSaving(false);
+    }
+  };
+
   return (
     <div className="space-y-3">
       {data.synonyms?.length > 0 && (
@@ -290,12 +358,13 @@ function AssetDetails({ data, onNavigateToNode }: { data: any; onNavigateToNode?
       {data.modality && (
         <div>
           <p className="text-xs text-gray-500 uppercase font-medium">Modality</p>
-          <div className="flex items-center space-x-2">
+          <div className="flex items-center flex-wrap gap-2">
             <span className="text-sm text-gray-700">{data.modality}</span>
-            {data.modality_confidence && (
-              <span className="text-xs text-gray-400">
-                ({formatConfidence(data.modality_confidence)} confidence)
-              </span>
+            {data.modality_user_confirmed && (
+              <span className="text-xs bg-green-100 text-green-700 px-1.5 py-0.5 rounded">User confirmed</span>
+            )}
+            {data.modality_confidence && !data.modality_user_confirmed && (
+              <span className="text-xs text-gray-400">({formatConfidence(data.modality_confidence)} confidence)</span>
             )}
           </div>
         </div>
@@ -313,6 +382,9 @@ function AssetDetails({ data, onNavigateToNode }: { data: any; onNavigateToNode?
                 {target}
               </span>
             ))}
+            {data.targets_user_confirmed && (
+              <span className="text-xs bg-green-100 text-green-700 px-1.5 py-0.5 rounded">User confirmed</span>
+            )}
           </div>
         </div>
       )}
@@ -327,41 +399,214 @@ function AssetDetails({ data, onNavigateToNode }: { data: any; onNavigateToNode?
       {data.owners?.length > 0 && (
         <div>
           <p className="text-xs text-gray-500 uppercase font-medium mb-2">
-            Owners (Inferred) <span className="text-blue-500 font-normal">— click to focus</span>
+            Owners <span className="text-blue-500 font-normal">— click to focus</span>
           </p>
           <div className="space-y-2">
             {data.owners.map((owner: any) => (
-              <button
+              <div
                 key={owner.company_id}
-                onClick={() => onNavigateToNode?.(owner.company_id, 'company')}
-                className="w-full bg-blue-50 hover:bg-blue-100 rounded p-2 flex items-center justify-between transition-colors cursor-pointer"
+                className="flex items-center gap-2 w-full bg-blue-50 hover:bg-blue-100 rounded p-2"
               >
-                <div className="flex items-center space-x-2">
-                  <Building2 className="w-4 h-4 text-blue-500" />
-                  <span className="text-sm text-blue-600 hover:underline">{owner.name}</span>
-                </div>
-                {owner.ownership?.confidence && (
-                  <span className="text-xs text-gray-400">
-                    {formatConfidence(owner.ownership.confidence)}
-                  </span>
+                <button
+                  type="button"
+                  onClick={() => onNavigateToNode?.(owner.company_id, 'company')}
+                  className="flex-1 flex items-center justify-between text-left min-w-0"
+                >
+                  <div className="flex items-center space-x-2 min-w-0">
+                    <Building2 className="w-4 h-4 text-blue-500 flex-shrink-0" />
+                    <span className="text-sm text-blue-600 hover:underline truncate">{owner.name}</span>
+                    {owner.ownership?.user_confirmed && (
+                      <span className="text-xs bg-green-100 text-green-700 px-1.5 py-0.5 rounded flex-shrink-0">Confirmed</span>
+                    )}
+                  </div>
+                  {owner.ownership?.confidence && !owner.ownership?.user_confirmed && (
+                    <span className="text-xs text-gray-400 flex-shrink-0 ml-1">{formatConfidence(owner.ownership.confidence)}</span>
+                  )}
+                </button>
+                {!owner.ownership?.user_confirmed && (
+                  <button
+                    type="button"
+                    onClick={async () => {
+                      try {
+                        await updateAsset(assetId, { owner_company_id: owner.company_id });
+                        onRefreshEntity?.();
+                      } catch (e) {
+                        setSaveError(e instanceof Error ? e.message : 'Confirm failed');
+                      }
+                    }}
+                    className="flex-shrink-0 text-xs font-medium text-green-700 bg-green-100 hover:bg-green-200 px-2 py-1 rounded"
+                  >
+                    Confirm
+                  </button>
                 )}
-              </button>
+              </div>
             ))}
           </div>
-          <p className="text-xs text-gray-400 mt-2 flex items-center">
-            <AlertCircle className="w-3 h-3 mr-1" />
-            Ownership inferred from trial sponsorship
-          </p>
+          {!data.owners.some((o: any) => o.ownership?.user_confirmed) && (
+            <p className="text-xs text-gray-400 mt-2 flex items-center">
+              <AlertCircle className="w-3 h-3 mr-1" />
+              Inferred from trials — click Confirm to lock
+            </p>
+          )}
         </div>
       )}
+
+      {/* Confirm / Edit section */}
+      <div className="pt-4 border-t border-gray-200">
+        <h3 className="text-sm font-medium text-gray-700 mb-2 flex items-center">
+          <Check className="w-4 h-4 mr-1.5 text-green-600" />
+          Confirm or edit
+        </h3>
+        <p className="text-xs text-gray-500 mb-3">
+          Your changes are kept on the next sync.
+        </p>
+        {!editing ? (
+          <button
+            type="button"
+            onClick={() => { setEditing(true); setSaveError(null); }}
+            className="w-full text-sm py-2 px-3 border border-gray-300 rounded-lg text-gray-700 hover:bg-gray-50"
+          >
+            Edit modality, targets, or owner
+          </button>
+        ) : (
+          <div className="space-y-3">
+            <div>
+              <label className="block text-xs text-gray-500 uppercase font-medium mb-1">Modality</label>
+              <select
+                value={editModality}
+                onChange={(e) => setEditModality(e.target.value)}
+                className="w-full text-sm border border-gray-300 rounded-lg px-3 py-2"
+              >
+                <option value="">—</option>
+                {MODALITY_OPTIONS.map((m) => (
+                  <option key={m} value={m}>{m.replace(/_/g, ' ')}</option>
+                ))}
+              </select>
+            </div>
+            <div>
+              <label className="block text-xs text-gray-500 uppercase font-medium mb-1">Targets (molecular)</label>
+              <div className="flex flex-wrap gap-1 mb-1">
+                {editTargets.map((t) => (
+                  <span
+                    key={t}
+                    className="text-xs bg-purple-100 text-purple-700 px-2 py-0.5 rounded flex items-center gap-1"
+                  >
+                    {t}
+                    <button
+                      type="button"
+                      onClick={() => setEditTargets((prev) => prev.filter((x) => x !== t))}
+                      className="text-purple-500 hover:text-purple-700"
+                    >
+                      ×
+                    </button>
+                  </span>
+                ))}
+              </div>
+              <div className="flex gap-1">
+                <input
+                  type="text"
+                  value={newTarget}
+                  onChange={(e) => setNewTarget(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter' && newTarget.trim()) {
+                      setEditTargets((prev) => [...prev, newTarget.trim()]);
+                      setNewTarget('');
+                    }
+                  }}
+                  placeholder="Add target (e.g. PD-1)"
+                  className="flex-1 text-sm border border-gray-300 rounded-lg px-2 py-1"
+                />
+                <button
+                  type="button"
+                  onClick={() => {
+                    if (newTarget.trim()) {
+                      setEditTargets((prev) => [...prev, newTarget.trim()]);
+                      setNewTarget('');
+                    }
+                  }}
+                  className="text-sm px-2 py-1 border border-gray-300 rounded-lg hover:bg-gray-50"
+                >
+                  <Plus className="w-4 h-4" />
+                </button>
+              </div>
+            </div>
+            <div>
+              <label className="block text-xs text-gray-500 uppercase font-medium mb-1">Owner (confirm or set)</label>
+              <input
+                type="text"
+                value={ownerSearch}
+                onChange={(e) => {
+                  setOwnerSearch(e.target.value);
+                  runOwnerSearch(e.target.value);
+                }}
+                placeholder="Search existing sponsor"
+                className="w-full text-sm border border-gray-300 rounded-lg px-3 py-2 mb-1"
+              />
+              {ownerSearchResults.length > 0 && (
+                <ul className="border border-gray-200 rounded-lg divide-y max-h-32 overflow-y-auto mb-2">
+                  {ownerSearchResults.map((c) => (
+                    <li key={c.company_id}>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setSelectedOwnerId(c.company_id);
+                          setOwnerSearch(c.name);
+                          setOwnerSearchResults([]);
+                        }}
+                        className="w-full text-left text-sm px-3 py-2 hover:bg-gray-50"
+                      >
+                        {c.name}
+                      </button>
+                    </li>
+                  ))}
+                </ul>
+              )}
+              <input
+                type="text"
+                value={newOwnerName}
+                onChange={(e) => setNewOwnerName(e.target.value)}
+                placeholder="Or add new sponsor by name"
+                className="w-full text-sm border border-gray-300 rounded-lg px-3 py-2"
+              />
+              {(selectedOwnerId || newOwnerName.trim()) && (
+                <p className="text-xs text-green-600 mt-1">
+                  Will set/confirm owner on save
+                </p>
+              )}
+            </div>
+            <div className="flex gap-2">
+              <button
+                type="button"
+                onClick={handleSave}
+                disabled={saving}
+                className="flex-1 text-sm py-2 px-3 bg-green-600 text-white rounded-lg hover:bg-green-700 disabled:opacity-50"
+              >
+                {saving ? 'Saving…' : 'Save'}
+              </button>
+              <button
+                type="button"
+                onClick={() => { setEditing(false); setSaveError(null); }}
+                className="text-sm py-2 px-3 border border-gray-300 rounded-lg text-gray-700 hover:bg-gray-50"
+              >
+                Cancel
+              </button>
+            </div>
+            {saveError && (
+              <p className="text-sm text-red-600 bg-red-50 rounded-lg px-3 py-2 mt-2">
+                {saveError}
+              </p>
+            )}
+          </div>
+        )}
+      </div>
 
       {data.trials?.length > 0 && (
         <div>
           <p className="text-xs text-gray-500 uppercase font-medium mb-2">
             Trials ({data.trials.length}) <span className="text-blue-500 font-normal">— click to focus</span>
           </p>
-          <div className="space-y-2 max-h-48 overflow-y-auto">
-            {data.trials.slice(0, 5).map((trial: any) => (
+          <div className="space-y-2 max-h-80 overflow-y-auto">
+            {sortTrialsActiveFirst(data.trials).slice(0, 20).map((trial: any) => (
               <button
                 key={trial.trial_id}
                 onClick={() => onNavigateToNode?.(trial.trial_id, 'trial')}
@@ -369,6 +614,14 @@ function AssetDetails({ data, onNavigateToNode }: { data: any; onNavigateToNode?
               >
                 <p className="text-sm font-medium text-blue-600 hover:underline">{trial.trial_id}</p>
                 <p className="text-xs text-gray-600 truncate">{trial.title}</p>
+                <div className="flex items-center space-x-2 mt-1">
+                  <span className="text-xs bg-amber-200 px-1.5 py-0.5 rounded">
+                    {formatPhase(trial.phase)}
+                  </span>
+                  <span className={cn('text-xs', getStatusColor(trial.status))}>
+                    {formatStatus(trial.status)}
+                  </span>
+                </div>
               </button>
             ))}
           </div>

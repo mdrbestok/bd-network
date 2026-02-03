@@ -100,6 +100,26 @@ export function getStatusColor(status?: string): string {
   return 'text-gray-500';
 }
 
+/** Sort order for trial status: active first, then completed, then terminated/withdrawn */
+const TRIAL_STATUS_ORDER: Record<string, number> = {
+  RECRUITING: 0,
+  NOT_YET_RECRUITING: 1,
+  ACTIVE_NOT_RECRUITING: 2,
+  ENROLLING_BY_INVITATION: 3,
+  SUSPENDED: 4,
+  COMPLETED: 5,
+  TERMINATED: 6,
+  WITHDRAWN: 7,
+};
+
+export function sortTrialsActiveFirst(trials: { status?: string }[]): typeof trials {
+  return [...trials].sort((a, b) => {
+    const orderA = TRIAL_STATUS_ORDER[a.status?.toUpperCase() ?? ''] ?? 10;
+    const orderB = TRIAL_STATUS_ORDER[b.status?.toUpperCase() ?? ''] ?? 10;
+    return orderA - orderB;
+  });
+}
+
 // Truncate text
 export function truncate(text: string, maxLength: number): string {
   if (text.length <= maxLength) return text;
